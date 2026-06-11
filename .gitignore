@@ -1,0 +1,11 @@
+# Outputs del spike: contienen datos del tenant - nunca al repo
+spikes/output/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Local
+*.local.*
+.env
