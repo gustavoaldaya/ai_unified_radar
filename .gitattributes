@@ -1,0 +1,10 @@
+# Normalizar finales de línea: LF en el repo y en checkout (mata los warnings autocrlf en Windows)
+* text=auto eol=lf
+
+# Tipos binarios (sin normalización)
+*.parquet binary
+*.png binary
+*.jpg binary
+*.zip binary
+*.xlsx binary
+*.pdf binary

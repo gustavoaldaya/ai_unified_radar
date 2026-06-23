@@ -12,6 +12,7 @@ Gobierno unificado de flota agéntica Microsoft en **3 planos** + capa **FinOps 
 
 - `docs/` — snapshots versionados de ADRs y specs. **La fuente canónica es el vault Obsidian (`KnowledgeBase/`)**; aquí viajan baselines para trazabilidad git.
 - `spikes/` — código de validación. Los outputs (`spikes/output/`) contienen datos de tenant y están **git-ignorados**.
+- `agentlens/` — subproyecto **AgentLens**: observabilidad + FinOps de agentes (M365/Agents 365, Azure AI Foundry, Amazon Bedrock). Implementa la capa de ingesta de la flota (12 extractores sobre `BaseExtractor`, contra fixtures; cutover live gated en Service Principal). Decisiones propias en `agentlens/docs/adr/` (serie ADR-00x; ver [ADR-009](agentlens/docs/adr/adr-009-unified-monorepo.md)). Versionado con tags namespaced `agentlens-vX.Y.Z`.
 - `pipeline/` *(próximo)* — ingesta y consolidación Bronze/Silver/Gold de consumos (Anexo B del ADR): push-first, ventana de re-statement D-1..D-5, hechos en unidad nativa + valoración efectivo-fechada.
 
 ## Estado (2026-06-11)
