@@ -1,0 +1,5 @@
+[
+  {"metric_name":"Invocations","timestamp":"2026-06-17T09:00:00Z","value":120.0,"model_id":"anthropic.claude-3-5-sonnet","operation_name":"Converse","namespace":"AWS/Bedrock"},
+  {"metric_name":"InvocationLatency","timestamp":"2026-06-17T09:00:00Z","value":850.0,"model_id":"anthropic.claude-3-5-sonnet","operation_name":"Converse","namespace":"AWS/Bedrock"},
+  {"metric_name":"SessionCount","timestamp":"2026-06-17T09:00:00Z","value":14.0,"model_id":"agentcore-endpoint-1","operation_name":"Session","namespace":"Bedrock-AgentCore"}
+]

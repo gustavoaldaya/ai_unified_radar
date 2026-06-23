@@ -1,0 +1,4 @@
+[
+  {"resource_id":"/subscriptions/s1/rg/taagents/foundry","charge_period_start":"2026-06-17","billed_cost":42.18,"effective_cost":40.00,"consumed_quantity":155000.0,"consumed_unit":"tokens","meter_category":"Azure AI Foundry","meter_name":"gpt-4o-input","subscription_id":"s1","resource_group":"taagents","tags":{"project":"taagents001"}},
+  {"resource_id":"/subscriptions/s1/rg/taagents/foundry","charge_period_start":"2026-06-17","billed_cost":18.90,"effective_cost":18.90,"consumed_quantity":35000.0,"consumed_unit":"tokens","meter_category":"Azure AI Foundry","meter_name":"gpt-4o-output","subscription_id":"s1","resource_group":"taagents","tags":{"project":"taagents001"}}
+]

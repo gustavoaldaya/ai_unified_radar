@@ -1,0 +1,37 @@
+[
+  {
+    "package_id": "pkg-it-003",
+    "agent_type": "custom_engine",
+    "name": "IT Helpdesk Agent",
+    "description": "Triages IT tickets",
+    "publisher_email": "it-support@contoso.com",
+    "created": "2026-03-30T10:15:00Z",
+    "last_modified": "2026-06-15T11:00:00Z",
+    "deployment_status": "published",
+    "enabled": true,
+    "dlp_compliant": true,
+    "connectors": ["ServiceNow"],
+    "permissions": ["Tickets.ReadWrite"]
+  },
+  {
+    "package_id": "pkg-orphan-004",
+    "agent_type": "sharepoint",
+    "name": "Legacy Wiki Bot",
+    "description": "Registered but never invoked (unobserved_agent fixture)",
+    "publisher_email": "archive@contoso.com",
+    "created": "2026-02-10T08:00:00Z",
+    "last_modified": "2026-05-01T08:00:00Z",
+    "deployment_status": "disabled",
+    "enabled": false,
+    "dlp_compliant": true,
+    "connectors": [],
+    "permissions": []
+  },
+  {
+    "package_id": null,
+    "agent_type": "copilot_studio",
+    "name": "Malformed Agent",
+    "last_modified": "2026-06-17T07:00:00Z",
+    "enabled": true
+  }
+]

@@ -1,0 +1,46 @@
+[
+  {
+    "package_id": "pkg-hr-001",
+    "agent_type": "copilot_studio",
+    "name": "HR Copilot",
+    "description": "Answers HR policy questions",
+    "publisher_email": "hr-team@contoso.com",
+    "created": "2026-05-02T09:00:00Z",
+    "last_modified": "2026-06-17T08:30:00Z",
+    "deployment_status": "published",
+    "enabled": true,
+    "dlp_compliant": true,
+    "connectors": ["SharePoint", "MicrosoftGraph"],
+    "permissions": ["User.Read", "Sites.Read.All"],
+    "tenantRegion": "westeurope"
+  },
+  {
+    "package_id": "pkg-fin-002",
+    "agent_type": "agent_builder",
+    "name": "Finance Reconciliation Agent",
+    "description": "Reconciles invoices",
+    "publisher_email": "fin-ops@contoso.com",
+    "created": "2026-04-18T12:00:00Z",
+    "last_modified": "2026-06-16T15:45:00Z",
+    "deployment_status": "published",
+    "enabled": true,
+    "dlp_compliant": false,
+    "connectors": ["AzureSQL"],
+    "permissions": ["Files.Read.All"]
+  },
+  {
+    "package_id": "pkg-hr-001",
+    "agent_type": "copilot_studio",
+    "name": "HR Copilot",
+    "description": "Answers HR policy questions",
+    "publisher_email": "hr-team@contoso.com",
+    "created": "2026-05-02T09:00:00Z",
+    "last_modified": "2026-06-17T08:30:00Z",
+    "deployment_status": "published",
+    "enabled": true,
+    "dlp_compliant": true,
+    "connectors": ["SharePoint", "MicrosoftGraph"],
+    "permissions": ["User.Read", "Sites.Read.All"],
+    "tenantRegion": "westeurope"
+  }
+]

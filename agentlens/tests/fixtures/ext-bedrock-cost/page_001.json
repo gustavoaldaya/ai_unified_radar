@@ -1,0 +1,4 @@
+[
+  {"time_period_start":"2026-06-17","service":"Amazon Bedrock","usage_type":"EU-Claude3.5Sonnet-InputTokens","operation":"Converse","unblended_cost":12.40,"usage_quantity":900000.0},
+  {"time_period_start":"2026-06-17","service":"Amazon Bedrock","usage_type":"EU-Claude3.5Sonnet-OutputTokens","operation":"Converse","unblended_cost":31.10,"usage_quantity":250000.0}
+]

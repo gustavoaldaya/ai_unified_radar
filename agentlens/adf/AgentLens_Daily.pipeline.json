@@ -1,0 +1,54 @@
+{
+  "name": "AgentLens_Daily",
+  "properties": {
+    "description": "Daily orchestration: 4 parallel extractor groups -> Fabric transform (08:00 UTC) -> optimization engine (09:00 UTC). Schedules per architecture/Extractor Architecture.",
+    "activities": [
+      {
+        "name": "M365_Group",
+        "type": "ExecutePipeline",
+        "comment": "ext-m365-registry (02:00), ext-m365-usage (06:00), ext-m365-user-activity (06:00)",
+        "extractors": ["ext-m365-registry", "ext-m365-usage", "ext-m365-user-activity"]
+      },
+      {
+        "name": "Purview_Group",
+        "type": "ExecutePipeline",
+        "comment": "ext-purview-audit (hourly), ext-purview-dspm (04:00)",
+        "extractors": ["ext-purview-audit", "ext-purview-dspm"]
+      },
+      {
+        "name": "Foundry_Group",
+        "type": "ExecutePipeline",
+        "comment": "ext-foundry-traces (hourly), ext-foundry-metrics (hourly), ext-foundry-cost (daily-auto)",
+        "extractors": ["ext-foundry-traces", "ext-foundry-metrics", "ext-foundry-cost"]
+      },
+      {
+        "name": "Bedrock_Group",
+        "type": "ExecutePipeline",
+        "comment": "ext-bedrock-invocations/metrics/traces (hourly), ext-bedrock-cost (daily)",
+        "extractors": [
+          "ext-bedrock-invocations",
+          "ext-bedrock-metrics",
+          "ext-bedrock-traces",
+          "ext-bedrock-cost"
+        ]
+      },
+      {
+        "name": "Transform_Fabric",
+        "type": "FabricNotebook",
+        "comment": "Curated + gold build in Microsoft Fabric (ADR-007). Runs 08:00 UTC after extractor groups.",
+        "dependsOn": ["M365_Group", "Purview_Group", "Foundry_Group", "Bedrock_Group"]
+      },
+      {
+        "name": "Optimization_Engine",
+        "type": "FabricNotebook",
+        "comment": "Optimization backlog (ADR-006). Runs 09:00 UTC.",
+        "dependsOn": ["Transform_Fabric"]
+      }
+    ],
+    "schedule": {
+      "frequency": "Day",
+      "interval": 1,
+      "notes": "Hourly extractors run on their own trigger; this pipeline anchors the daily build."
+    }
+  }
+}

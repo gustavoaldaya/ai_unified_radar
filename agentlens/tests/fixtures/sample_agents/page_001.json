@@ -1,0 +1,28 @@
+[
+  {
+    "package_id": "pkg-001",
+    "name": "HR Copilot",
+    "agent_type": "copilot_studio",
+    "last_modified": "2026-06-17T10:00:00Z",
+    "enabled": true,
+    "interaction_count": 1240,
+    "region": "westeurope"
+  },
+  {
+    "package_id": "pkg-002",
+    "name": "Finance Bot",
+    "agent_type": "agent_builder",
+    "last_modified": "2026-06-17T11:00:00Z",
+    "enabled": false,
+    "interaction_count": 87
+  },
+  {
+    "package_id": "pkg-001",
+    "name": "HR Copilot",
+    "agent_type": "copilot_studio",
+    "last_modified": "2026-06-17T10:00:00Z",
+    "enabled": true,
+    "interaction_count": 1240,
+    "region": "westeurope"
+  }
+]

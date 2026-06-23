@@ -1,0 +1,5 @@
+[
+  {"record_id":"aud-0001","creation_date":"2026-06-17T09:12:00Z","record_type":"CopilotInteraction","operation":"CopilotInteraction","app_identity":"pkg-hr-001","user_id":"u-001","workload":"Copilot","sensitivity_labels":["Confidential"],"dlp_matches":[],"ClientRegion":"EU"},
+  {"record_id":"aud-0002","creation_date":"2026-06-17T10:30:00Z","record_type":"Agent365Activities","operation":"AgentActionExecuted","app_identity":"pkg-fin-002","user_id":"u-002","workload":"Agent365","sensitivity_labels":[],"dlp_matches":["FinancialData"]},
+  {"record_id":"aud-0003","creation_date":"2026-06-17T11:05:00Z","record_type":"AIApp","operation":"AgentConfigurationChanged","app_identity":"pkg-it-003","user_id":"u-003","workload":"Copilot"}
+]

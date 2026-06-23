@@ -1,0 +1,9 @@
+[
+  {"package_id":"pkg-hr-001","report_date":"2026-06-15","agent_name":"HR Copilot","active_users":10,"total_message_count":100,"agent_type":"Declarative","last_activity":"2026-06-15T18:00:00Z","is_anonymized":false},
+  {"package_id":"pkg-hr-001","report_date":"2026-06-16","agent_name":"HR Copilot","active_users":12,"total_message_count":130,"agent_type":"Declarative","last_activity":"2026-06-16T18:00:00Z","is_anonymized":false,"reportRefreshDate":"2026-06-16"},
+  {"package_id":"pkg-hr-001","report_date":"2026-06-17","agent_name":"HR Copilot","active_users":15,"total_message_count":160,"agent_type":"Declarative","last_activity":"2026-06-17T18:00:00Z","is_anonymized":false},
+  {"package_id":"pkg-fin-002","report_date":"2026-06-17","agent_name":"Finance Reconciliation Agent","active_users":3,"total_message_count":20,"agent_type":"CustomEngine","is_anonymized":true},
+  {"package_id":"pkg-hr-001","report_date":"2026-06-17","agent_name":"HR Copilot","active_users":15,"total_message_count":160,"agent_type":"Declarative","last_activity":"2026-06-17T18:00:00Z","is_anonymized":false},
+  {"package_id":"pkg-orphan-999","report_date":"2026-06-17","agent_name":"Ghost Agent","active_users":1,"total_message_count":2,"agent_type":"Declarative"},
+  {"package_id":null,"report_date":"2026-06-17","agent_name":"Malformed Usage Row"}
+]

@@ -1,0 +1,4 @@
+[
+  {"span_id":"bspan-0001","trace_id":"btrace-0001","timestamp":"2026-06-17T09:00:01Z","agent_endpoint_id":"agentcore-endpoint-1","session_id":"sess-1","gen_ai_agent_id":"agt-bedrock-001","tool_invocations":["retrieve"],"latency_ms":640.0,"token_count":1100,"error_type":null,"otelResource":"agentcore"},
+  {"span_id":"bspan-0002","trace_id":"btrace-0001","timestamp":"2026-06-17T09:00:02Z","agent_endpoint_id":"agentcore-endpoint-1","session_id":"sess-1","gen_ai_agent_id":"agt-bedrock-001","tool_invocations":[],"latency_ms":15.0,"token_count":0}
+]

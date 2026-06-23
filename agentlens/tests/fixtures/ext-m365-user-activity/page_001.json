@@ -1,0 +1,5 @@
+[
+  {"user_id":"u-001","report_date":"2026-06-17","product":"Teams","activity_count":42,"is_active":true,"is_anonymized":false,"reportPeriod":"7"},
+  {"user_id":"u-002","report_date":"2026-06-17","product":"SharePoint","activity_count":7,"is_active":true,"is_anonymized":false},
+  {"user_id":"u-003","report_date":"2026-06-17","product":"Exchange","activity_count":0,"is_active":false,"is_anonymized":true}
+]

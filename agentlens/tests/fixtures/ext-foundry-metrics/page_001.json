@@ -1,0 +1,5 @@
+[
+  {"metric_name":"ProcessedPromptTokens","timestamp":"2026-06-17T09:00:00Z","value":120000.0,"model_deployment_name":"gpt4o-prod","model_name":"gpt-4o","model_version":"2024-11-20","region":"westeurope","api_name":"Chat","status_code":"200"},
+  {"metric_name":"GeneratedCompletionTokens","timestamp":"2026-06-17T09:00:00Z","value":35000.0,"model_deployment_name":"gpt4o-prod","model_name":"gpt-4o","region":"westeurope","api_name":"Chat","status_code":"200"},
+  {"metric_name":"ProcessedPromptTokens","timestamp":"2026-06-17T10:00:00Z","value":98000.0,"model_deployment_name":"gpt4o-prod","model_name":"gpt-4o","region":"westeurope"}
+]

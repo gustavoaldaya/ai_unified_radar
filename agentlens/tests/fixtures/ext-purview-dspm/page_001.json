@@ -1,0 +1,4 @@
+[
+  {"dspm_agent_instance_id":"dspm-001","assessment_date":"2026-06-17","insider_risk_level":"Low","sensitivity_accessed":["Confidential"],"dlp_violations":0,"oversharing_detected":false,"entra_agent_id":"agt-hr-001","package_id":"pkg-hr-001","connectorScope":"M365"},
+  {"dspm_agent_instance_id":"dspm-002","assessment_date":"2026-06-17","insider_risk_level":"High","sensitivity_accessed":["Confidential","Secret"],"dlp_violations":3,"oversharing_detected":true,"entra_agent_id":"agt-fin-002","package_id":"pkg-fin-002"}
+]

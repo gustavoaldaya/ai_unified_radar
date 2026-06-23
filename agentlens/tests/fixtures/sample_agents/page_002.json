@@ -1,0 +1,16 @@
+[
+  {
+    "package_id": "pkg-003",
+    "agent_type": "custom_engine",
+    "last_modified": "2026-06-17T12:00:00Z",
+    "enabled": true,
+    "interaction_count": 5
+  },
+  {
+    "package_id": null,
+    "name": "Broken Agent",
+    "agent_type": "copilot_studio",
+    "last_modified": "2026-06-17T09:00:00Z",
+    "enabled": true
+  }
+]
