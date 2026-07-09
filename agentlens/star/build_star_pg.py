@@ -55,6 +55,7 @@ TRACE_SOURCES = [
     {
         "glob": "foundry/traces/dt=*/*.parquet",
         "cloud": "azure",
+        "id_namespace": "foundry_otel",
         "agent_id": ("gen_ai_agent_id",),
         "agent_name": "gen_ai_agent_name",
         "model": "deployment_name",
@@ -63,6 +64,7 @@ TRACE_SOURCES = [
     {
         "glob": "bedrock/traces/dt=*/*.parquet",
         "cloud": "aws",
+        "id_namespace": "bedrock_arn",
         "agent_id": ("gen_ai_agent_id", "agent_endpoint_id"),
         "agent_name": None,
         "model": None,  # AgentCore traces carry no model_id -- the AWS gap
@@ -89,6 +91,7 @@ COST_SOURCES = [
 _ALL_TABLES = (
     "etl_load_log",
     "fact_resource_cost",
+    "fact_agent_traces",
     "fact_agent_snapshot",
     "fact_agent_consumption",
     "bridge_agent_skill",
@@ -276,7 +279,18 @@ class StarBuilder:
         self._metrics: dict[tuple[str, str, str], int] = {}
         self._dates: set[int] = set()
         # fact rows staged for bulk upsert
-        self._consumption: list[tuple[int, int, int, int, str, Any, int]] = []
+        self._consumption: list[tuple] = []
+        # span-grain rows staged for fact_agent_traces (ADR-010)
+        self._traces: list[tuple] = []
+        # identity bridge (ADR-010): (id_namespace, base native id) -> agent_key
+        self._bridge: dict[tuple[str, str], int] = {}
+        self.cur.execute("SELECT to_regclass(%s)", (f"{schema}.bridge_agent_identity",))
+        if self.cur.fetchone()[0] is not None:
+            self.cur.execute(
+                f"SELECT id_namespace, native_id, agent_key "
+                f"FROM {schema}.bridge_agent_identity WHERE valid_to IS NULL"
+            )
+            self._bridge = {(ns, nid): int(k) for ns, nid, k in self.cur.fetchall()}
 
     # ---- dimensions -----------------------------------------------------
 
@@ -469,6 +483,7 @@ class StarBuilder:
     def _stage(
         self, agent_key: int, cloud: str, metric_name: str, namespace: str,
         model_native: str, ts: str, value: Any, attributed: int,
+        resolution_tier: str = "unattributed",
     ) -> None:
         self._consumption.append((
             agent_key,
@@ -478,38 +493,97 @@ class StarBuilder:
             ts,
             float(value) if isinstance(value, (int, float)) else value,
             attributed,
+            resolution_tier,
         ))
+
+    @staticmethod
+    def _otel_base(native_id: str) -> str:
+        """Strip a trailing ':version' from an otel_agent_id ('x:15' -> 'x')."""
+        return native_id.rsplit(":", 1)[0] if ":" in native_id else native_id
+
+    _SPAN_KIND = {
+        "invoke_agent": "agent_run", "create_agent": "agent_run",
+        "chat": "model_call", "text_completion": "model_call",
+        "execute_tool": "tool_call",
+    }
+
+    def _resolve_agent(
+        self, cloud: str, id_namespace: str,
+        span_native: str | None, trace_native: str | None,
+    ) -> tuple[int, str]:
+        """(agent_key, resolution_tier) per ADR-010. Bridge/native on the span's
+        own id first; else inherit a sibling's id from the same trace
+        (correlation); else the cloud sentinel (unattributed)."""
+        if span_native:
+            k = self._bridge.get((id_namespace, self._otel_base(span_native)))
+            if k is not None:
+                return k, "bridge"
+            k = self._agents.get((cloud, span_native))
+            if k is not None:
+                return k, "native"
+        if trace_native:
+            k = self._bridge.get((id_namespace, self._otel_base(trace_native)))
+            if k is None:
+                k = self._agents.get((cloud, trace_native))
+            if k is not None:
+                return k, "correlation"
+        return self.agent_key(cloud, UNATTRIBUTED, agent_name=None), "unattributed"
 
     def load_traces(self, raw_root: str) -> int:
         facts = 0
         for source in TRACE_SOURCES:
             cloud = source["cloud"]
-            for row in self.iter_rows(raw_root, source["glob"]):
+            namespace = source.get("id_namespace", "")
+            id_fields = source["agent_id"]
+            # Materialise once: iter_rows also drives the load-log watermark, so
+            # each glob must be consumed exactly once.
+            rows = list(self.iter_rows(raw_root, source["glob"]))
+            # Pass 1: trace_id -> first agent id seen anywhere in that trace.
+            trace_agent: dict[str, str] = {}
+            for row in rows:
+                tid = _text(row.get("trace_id"))
+                aid = next((_text(row.get(f)) for f in id_fields if _text(row.get(f))), None)
+                if tid and aid and tid not in trace_agent:
+                    trace_agent[tid] = aid
+            # Pass 2: resolve tier, land span-grain, stage consumption.
+            for row in rows:
                 ts = _text(row.get("timestamp"))
                 if ts is None:
                     continue
-                native_id = next(
-                    (_text(row.get(f)) for f in source["agent_id"] if _text(row.get(f))),
-                    None,
-                ) or UNATTRIBUTED
-                agent_key = self.agent_key(
-                    cloud, native_id,
-                    agent_name=_text(row.get(source["agent_name"]))
-                    if source["agent_name"] else None,
+                span_native = next(
+                    (_text(row.get(f)) for f in id_fields if _text(row.get(f))), None
+                )
+                tid = _text(row.get("trace_id"))
+                trace_native = trace_agent.get(tid) if tid else None
+                agent_key, tier = self._resolve_agent(
+                    cloud, namespace, span_native, trace_native
                 )
                 model_native = (
                     _text(row.get(source["model"])) if source["model"] else None
                 ) or UNKNOWN_MODEL
+                sid = _text(row.get("span_id"))
+                if tid and sid:
+                    op = _text(row.get("span_kind"))
+                    self._traces.append((
+                        tid, sid, _text(row.get("parent_span_id")),
+                        agent_key, self.model_key(cloud, model_native),
+                        self.date_key(ts), ts, op,
+                        self._SPAN_KIND.get(op or "", op),
+                        span_native, _text(row.get("caller_id")),
+                        _text(row.get("status_code")), row.get("latency_ms"),
+                        row.get("prompt_tokens"), row.get("completion_tokens"),
+                        row.get("total_tokens") or row.get("token_count"),
+                        None, None, tier,
+                    ))
                 for measure in source["measures"]:
                     value = row.get(measure)
                     if value is None:
                         continue
-                    # attributed means "carries real agent identity", not
-                    # "came from a trace": sentinel-routed spans stay 0.
                     self._stage(
                         agent_key, cloud, measure, "gen_ai",
                         model_native, ts, value,
-                        attributed=1 if native_id != UNATTRIBUTED else 0,
+                        attributed=1 if tier != "unattributed" else 0,
+                        resolution_tier=tier,
                     )
                     facts += 1
         return facts
@@ -625,17 +699,44 @@ class StarBuilder:
         self._consumption = list(by_pk.values())
         sql = f"""
             INSERT INTO {self.schema}.fact_agent_consumption
-                (agent_key, metric_key, model_key, date_key, ts, value, attributed)
+                (agent_key, metric_key, model_key, date_key, ts, value,
+                 attributed, resolution_tier)
             VALUES %s
             ON CONFLICT (agent_key, metric_key, model_key, ts) DO UPDATE SET
-                value      = EXCLUDED.value,
-                attributed = EXCLUDED.attributed,
-                date_key   = EXCLUDED.date_key
+                value           = EXCLUDED.value,
+                attributed      = EXCLUDED.attributed,
+                date_key        = EXCLUDED.date_key,
+                resolution_tier = EXCLUDED.resolution_tier
         """
         psycopg2.extras.execute_values(self.cur, sql, self._consumption, page_size=1000)
         n = len(self._consumption)
         self._consumption.clear()
         return n
+
+    def flush_traces(self) -> int:
+        """Bulk-upsert the staged span-grain rows into ``fact_agent_traces``."""
+        if not self._traces:
+            return 0
+        by_pk = {(r[0], r[1]): r for r in self._traces}
+        rows = list(by_pk.values())
+        psycopg2.extras.execute_values(
+            self.cur,
+            f"""
+            INSERT INTO {self.schema}.fact_agent_traces
+                (trace_id, span_id, parent_span_id, agent_key, model_key,
+                 date_key, ts, operation_name, span_kind, native_agent_id,
+                 caller_id, status, duration_ms, input_tokens, output_tokens,
+                 total_tokens, tool_name, content_ref, resolution_tier)
+            VALUES %s
+            ON CONFLICT (trace_id, span_id) DO UPDATE SET
+                agent_key       = EXCLUDED.agent_key,
+                resolution_tier = EXCLUDED.resolution_tier,
+                caller_id       = EXCLUDED.caller_id,
+                total_tokens    = EXCLUDED.total_tokens
+            """,
+            rows, page_size=1000,
+        )
+        return len(rows)
 
     def rebuild_snapshot(self) -> int:
         """Recompute ``fact_agent_snapshot`` from ``fact_agent_consumption``.
@@ -726,7 +827,7 @@ def _counts(conn: psycopg2.extensions.connection, schema: str) -> dict[str, int]
         for table in (
             "dim_agent", "dim_skill", "dim_connector", "dim_model", "dim_metric",
             "dim_date", "bridge_agent_skill", "bridge_agent_connector",
-            "fact_agent_consumption", "fact_agent_snapshot",
+            "fact_agent_traces", "fact_agent_consumption", "fact_agent_snapshot",
             "fact_resource_cost", "etl_load_log",
         ):
             cur.execute("SELECT to_regclass(%s)", (f"{schema}.{table}",))
@@ -777,6 +878,7 @@ def main(argv: list[str] | None = None) -> int:
         attributed = b.load_traces(args.raw_root)
         unattributed = b.load_metrics(args.raw_root)
         cost_rows = b.load_cost(args.raw_root)
+        trace_rows = b.flush_traces()
         facts_written = b.flush_consumption()
         snapshots = b.rebuild_snapshot()
         new_files, skipped_files = b.flush_load_log()
@@ -793,6 +895,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[star:pg] loaded into {args.schema}")
     print(f"  M365 agents:        {agents}")
     print(f"  consumption staged: {attributed} trace rows + {unattributed} metric rows")
+    print(f"  span rows:          {trace_rows} upserted into fact_agent_traces")
     print(f"  consumption upsert: {facts_written} rows written to fact_agent_consumption")
     print(f"  snapshot rows:      {snapshots}")
     print(f"  cost rows:          {cost_rows} upserted into fact_resource_cost")

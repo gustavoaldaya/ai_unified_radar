@@ -183,3 +183,110 @@ CREATE TABLE IF NOT EXISTS agentlens.etl_load_log (
     loaded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     row_count INTEGER
 );
+
+-- =====================================================================
+-- Identity resolution + span grain + consumption tiers (ADR-010) -- 2026-07-09
+--
+-- ADR-010 "Attribution as Tiered Resolution": la atribucion agente<->consumo
+-- se resuelve en la capa AgentLens con nivel de confianza explicito, sobre
+-- grano span preservado. fact_agent_consumption pasa a rollup derivado.
+--   * fact_agent_traces: landing a grano trace x span (topologia + caller +
+--     content_ref). Sirve observabilidad y seguridad; los rollups derivan de el.
+--   * bridge_agent_identity: mapeo cross-namespace otel_agent_id <-> packageId
+--     M365 <-> agent ARN. Materializa la mapping table de ADR-003. NO se trunca
+--     en --rebuild (dato curado); queda fuera de _ALL_TABLES en el loader.
+--   * resolution_tier (native|bridge|correlation|unattributed): cada consumidor
+--     filtra por confianza. Solo native+bridge son elegibles para chargeback.
+--   * cost_basis (metered|allocated): nunca facturar coste repartido como medido.
+-- =====================================================================
+
+CREATE TABLE IF NOT EXISTS agentlens.fact_agent_traces (
+    trace_id        TEXT        NOT NULL,
+    span_id         TEXT        NOT NULL,
+    parent_span_id  TEXT,
+    agent_key       INTEGER     REFERENCES agentlens.dim_agent (agent_key),
+    model_key       INTEGER     REFERENCES agentlens.dim_model (model_key),
+    date_key        INTEGER     REFERENCES agentlens.dim_date  (date_key),
+    ts              TIMESTAMPTZ NOT NULL,
+    operation_name  TEXT,            -- invoke_agent | chat | execute_tool | create_agent | text_completion
+    span_kind       TEXT,            -- agent_run | model_call | tool_call | retrieval
+    native_agent_id TEXT,            -- gen_ai.agent.id tal cual en el span (puede ser NULL)
+    caller_id       TEXT,            -- UserAuthenticatedId (best-effort; null-by-nature en runs programaticos)
+    status          TEXT,
+    duration_ms     DOUBLE PRECISION,
+    input_tokens    INTEGER,
+    output_tokens   INTEGER,
+    total_tokens    INTEGER,
+    tool_name       TEXT,
+    content_ref     TEXT,            -- puntero a AppGenAIContent (dato gobernado), no el contenido
+    resolution_tier TEXT        NOT NULL DEFAULT 'unattributed',
+    PRIMARY KEY (trace_id, span_id)
+);
+CREATE INDEX IF NOT EXISTS idx_fact_traces_agent ON agentlens.fact_agent_traces (agent_key);
+CREATE INDEX IF NOT EXISTS idx_fact_traces_date  ON agentlens.fact_agent_traces (date_key);
+
+CREATE TABLE IF NOT EXISTS agentlens.bridge_agent_identity (
+    agent_key    INTEGER     NOT NULL REFERENCES agentlens.dim_agent (agent_key) ON DELETE CASCADE,
+    id_namespace TEXT        NOT NULL,     -- foundry_otel | m365_package | bedrock_arn
+    native_id    TEXT        NOT NULL,     -- otel id base (version ':N' recortada) / packageId / ARN
+    source       TEXT        NOT NULL,     -- curated_production | m365_registry | name_match_bulk
+    confidence   TEXT        NOT NULL DEFAULT 'curated',   -- curated | name_match
+    valid_from   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    valid_to     TIMESTAMPTZ,
+    PRIMARY KEY (id_namespace, native_id)
+);
+
+-- Columnas anadidas a tablas preexistentes (idempotente en DBs pobladas):
+ALTER TABLE agentlens.fact_agent_consumption
+    ADD COLUMN IF NOT EXISTS resolution_tier TEXT NOT NULL DEFAULT 'unattributed';
+ALTER TABLE agentlens.fact_resource_cost
+    ADD COLUMN IF NOT EXISTS cost_basis TEXT NOT NULL DEFAULT 'metered';
+
+-- =====================================================================
+-- Vistas de consumo (ADR-010) -- 2026-07-09
+-- =====================================================================
+
+-- FinOps: coste-por-agente por reparto de cuota de tokens (marcado allocated).
+-- Coste vacio hasta que ext-foundry-cost cargue fact_resource_cost; las cuotas
+-- de tokens ya son reales. chargeback_eligible = solo tiers native/bridge.
+CREATE OR REPLACE VIEW agentlens.v_finops_agent_cost AS
+WITH agent_day AS (
+    SELECT t.agent_key, t.date_key,
+           SUM(COALESCE(t.total_tokens,0)) AS tokens,
+           COUNT(*) FILTER (WHERE t.operation_name='invoke_agent') AS invocations,
+           bool_or(t.resolution_tier IN ('native','bridge')) AS chargeback_eligible
+    FROM agentlens.fact_agent_traces t
+    WHERE t.resolution_tier <> 'unattributed'
+    GROUP BY t.agent_key, t.date_key
+),
+day_tokens AS (SELECT date_key, SUM(tokens) AS total_tokens FROM agent_day GROUP BY date_key),
+day_cost AS (
+    SELECT date_key, SUM(COALESCE(effective_cost, billed_cost, 0)) AS cost, MAX(currency) AS currency
+    FROM agentlens.fact_resource_cost GROUP BY date_key
+)
+SELECT ad.agent_key, a.agent_name, ad.date_key, ad.tokens, ad.invocations,
+       ad.chargeback_eligible, dt.total_tokens, dc.cost AS day_resource_cost, dc.currency,
+       CASE WHEN dt.total_tokens > 0
+            THEN ROUND(((ad.tokens::numeric / dt.total_tokens) * COALESCE(dc.cost,0))::numeric, 6)
+            ELSE 0 END AS allocated_cost,
+       'allocated'::text AS cost_basis
+FROM agent_day ad
+JOIN agentlens.dim_agent a ON a.agent_key = ad.agent_key
+JOIN day_tokens dt ON dt.date_key = ad.date_key
+LEFT JOIN day_cost dc ON dc.date_key = ad.date_key;
+
+-- Seguridad: consumo sin atribuir = senal de gobierno (shadow / test / guid-only).
+CREATE OR REPLACE VIEW agentlens.v_security_unregistered_consumption AS
+SELECT split_part(COALESCE(t.native_agent_id,''), ':', 1) AS unresolved_agent_id,
+       CASE
+         WHEN t.native_agent_id IS NULL OR t.native_agent_id = '' THEN 'no_agent_id'
+         WHEN t.native_agent_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-' THEN 'guid_only'
+         ELSE 'named_unregistered'
+       END AS signal_class,
+       COUNT(*) AS spans, COUNT(DISTINCT t.trace_id) AS traces,
+       SUM(COALESCE(t.total_tokens,0)) AS tokens,
+       MIN(t.ts) AS first_seen, MAX(t.ts) AS last_seen
+FROM agentlens.fact_agent_traces t
+WHERE t.resolution_tier = 'unattributed'
+GROUP BY 1, 2
+ORDER BY tokens DESC;
