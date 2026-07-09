@@ -56,7 +56,7 @@ versiona aparte desde local.
   dimensión usuario/caller es del plano Purview (Unified Audit Log, ADR-005), no
   de las trazas. `caller_id` queda como captura oportunista.
 
-## Commits (mensajes convencionales de la unidad)
+## Commits listos (tras regenerar PAT con Contents: write)
 ```
 feat(agentlens/attribution): tiered agent resolution over span-grain facts (ADR-010)
 feat(agentlens/schema): fact_agent_traces + bridge_agent_identity + tier/cost_basis cols + finops/security views
@@ -67,5 +67,5 @@ docs(agentlens): ADR-010 accepted; CHANGELOG-attribution
 ## Pendiente (ver handoff)
 - `ext-foundry-cost` sigue en 429 → `v_finops_agent_cost` sin coste (cuotas de
   tokens ya reales); reintentar SOLO tras reset horario.
-- Backlog previo al 2026-07-02 aún por versionar desde local.
+- Regenerar PAT y commitear (sin versionar desde 2026-07-02).
 - Promover a `curated` los 20 `name_match` tras revisión (o versionarlos).

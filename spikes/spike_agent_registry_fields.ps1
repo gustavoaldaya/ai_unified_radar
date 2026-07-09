@@ -14,12 +14,12 @@ try {
   $pkgs = Invoke-MgGraphRequest -Method GET `
     -Uri "https://graph.microsoft.com/beta/copilot/admin/catalog/packages?`$top=100" `
     -OutputType PSObject
-  $pkgs | ConvertTo-Json -Depth 10 | Out-File "$out\packages_list.json" -Encoding utf8NoBOM
+  $pkgs | ConvertTo-Json -Depth 10 | Out-File "$out\packages_list.json" -Encoding utf8
   $pkgs.value | ForEach-Object { $_.PSObject.Properties.Name } |
-    Sort-Object -Unique | Out-File "$out\packages_fields.txt" -Encoding utf8NoBOM
+    Sort-Object -Unique | Out-File "$out\packages_fields.txt" -Encoding utf8
   Write-Host "C1: $($pkgs.value.Count) packages. Campos en packages_fields.txt"
 } catch {
-  $_ | Out-File "$out\packages_error.txt" -Encoding utf8NoBOM
+  $_ | Out-File "$out\packages_error.txt" -Encoding utf8
   Write-Host "C1/C4: error en packages - ver packages_error.txt"
 }
 
@@ -35,8 +35,8 @@ if ($pkgs) {
       $d = Invoke-MgGraphRequest -Method GET `
         -Uri "https://graph.microsoft.com/beta/copilot/admin/catalog/packages/$($p.id)" `
         -OutputType PSObject
-      $d | ConvertTo-Json -Depth 15 | Out-File "$out\package_detail_$($p.id).json" -Encoding utf8NoBOM
-    } catch { "$($p.id): $($_.Exception.Message)" | Out-File "$out\package_detail_errors.txt" -Append -Encoding utf8NoBOM }
+      $d | ConvertTo-Json -Depth 15 | Out-File "$out\package_detail_$($p.id).json" -Encoding utf8
+    } catch { "$($p.id): $($_.Exception.Message)" | Out-File "$out\package_detail_errors.txt" -Append -Encoding utf8 }
   }
 }
 
@@ -44,15 +44,15 @@ if ($pkgs) {
 try {
   $inst = Invoke-MgGraphRequest -Method GET `
     -Uri "https://graph.microsoft.com/beta/agentRegistry/agentInstances" -OutputType PSObject
-  $inst | ConvertTo-Json -Depth 10 | Out-File "$out\agent_instances.json" -Encoding utf8NoBOM
+  $inst | ConvertTo-Json -Depth 10 | Out-File "$out\agent_instances.json" -Encoding utf8
   foreach ($i in ($inst.value | Select-Object -First 10)) {
     try {
       $card = Invoke-MgGraphRequest -Method GET `
         -Uri "https://graph.microsoft.com/beta/agentRegistry/agentInstances/$($i.id)/agentCardManifest" `
         -OutputType PSObject
-      $card | ConvertTo-Json -Depth 15 | Out-File "$out\agent_card_$($i.id).json" -Encoding utf8NoBOM
-    } catch { "$($i.id): $($_.Exception.Message)" | Out-File "$out\agent_card_errors.txt" -Append -Encoding utf8NoBOM }
+      $card | ConvertTo-Json -Depth 15 | Out-File "$out\agent_card_$($i.id).json" -Encoding utf8
+    } catch { "$($i.id): $($_.Exception.Message)" | Out-File "$out\agent_card_errors.txt" -Append -Encoding utf8 }
   }
-} catch { $_ | Out-File "$out\agent_instances_error.txt" -Encoding utf8NoBOM }
+} catch { $_ | Out-File "$out\agent_instances_error.txt" -Encoding utf8 }
 
 Write-Host "Spike completado. Entregar a Claude: packages_fields.txt + 2-3 package_detail_*.json + 1-2 agent_card_*.json"
