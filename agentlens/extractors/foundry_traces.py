@@ -41,6 +41,11 @@ def build_kql(since: str | None) -> str:
         ``gen_ai.response.model`` carries the underlying model id.
       * ``gen_ai.agent.id`` is emitted by the Foundry Agents service;
         ``gen_ai.assistant.id`` was the pre-GA assistants spelling.
+      * caller identity, when present, travels in the ``Properties`` bag as
+        ``user.id`` (current semconv; carries Entra object ids) -- the native
+        ``User*`` columns are empty in this workspace (probe_caller 2026-07-09).
+        Bag keys go FIRST in the coalesce: the native columns yield '' (non
+        null) and would shadow the bag otherwise.
       * tostring() on a missing dynamic key yields '' (not null); the star
         loader's ``_text`` treats '' as NULL downstream, so no special-casing.
     """
@@ -62,6 +67,8 @@ AppDependencies
     parent_span_id    = tostring(ParentId),
     timestamp         = tostring(TimeGenerated),
     caller_id         = tostring(coalesce(
+                            Properties["user.id"],
+                            Properties["enduser.id"],
                             column_ifexists("UserAuthenticatedId", ""),
                             column_ifexists("UserId", ""))),
     gen_ai_agent_id   = tostring(coalesce(

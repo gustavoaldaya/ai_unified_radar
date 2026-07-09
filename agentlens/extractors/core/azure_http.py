@@ -69,18 +69,20 @@ class AzureJsonSource:
             return exc.code, error_body, float(retry_after) if retry_after else None
 
     def _get_with_headers(
-        self, url: str, token: str
+        self, url: str, token: str, timeout: float = 60.0
     ) -> tuple[int, Any, dict[str, str]]:  # pragma: no cover - network
         """GET returning (status, json_body, response_headers).
 
         Needed by sources that paginate via a response header (e.g. the O365
         Management Activity API's ``NextPageUri``) rather than a body field.
+        ``timeout`` is overridable: the O365 content feed can legitimately take
+        longer than 60s to answer (observed 2026-07-09).
         """
         request = urllib.request.Request(
             url, headers={"Authorization": f"Bearer {token}"}
         )
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:  # noqa: S310
+            with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
                 body = json.loads(response.read().decode("utf-8"))
                 return response.status, body, dict(response.headers)
         except urllib.error.HTTPError as exc:
