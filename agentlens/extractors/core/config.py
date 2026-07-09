@@ -30,6 +30,13 @@ def _parse_holidays(value: str | None) -> frozenset[date]:
     return frozenset(out)
 
 
+def _parse_csv(value: str | None, *, default: tuple[str, ...]) -> tuple[str, ...]:
+    if not value:
+        return default
+    items = tuple(token.strip() for token in value.split(",") if token.strip())
+    return items or default
+
+
 @dataclass(frozen=True)
 class Settings:
     """Immutable runtime configuration."""
@@ -39,6 +46,8 @@ class Settings:
     fixtures_root: str = "tests/fixtures"
     business_week_mon_fri: bool = True
     holidays: frozenset[date] = field(default_factory=frozenset)
+    # CloudWatch namespaces ext-bedrock-metrics discovers metrics from.
+    bedrock_metric_namespaces: tuple[str, ...] = ("AWS/Bedrock",)
     # Live-only (unused while use_fixtures is True).
     adls_account_url: str | None = None
     adls_filesystem: str | None = None
@@ -54,6 +63,9 @@ class Settings:
             fixtures_root=source.get("FIXTURES_ROOT", "tests/fixtures"),
             business_week_mon_fri=(business_week == "mon-fri"),
             holidays=_parse_holidays(source.get("HOLIDAY_CALENDAR")),
+            bedrock_metric_namespaces=_parse_csv(
+                source.get("BEDROCK_METRIC_NAMESPACES"), default=("AWS/Bedrock",)
+            ),
             adls_account_url=source.get("ADLS_ACCOUNT_URL"),
             adls_filesystem=source.get("ADLS_FILESYSTEM"),
             key_vault_uri=source.get("KEY_VAULT_URI"),

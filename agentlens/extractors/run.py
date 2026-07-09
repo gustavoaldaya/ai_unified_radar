@@ -12,14 +12,34 @@ the live cutover is the same command with ``USE_FIXTURES=false`` + credentials.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+from pathlib import Path
 
 from extractors.catalog import CATALOG, get_extractor
 from extractors.core.config import Settings
 from extractors.core.storage import build_backend
 
 
+def _load_dotenv() -> None:
+    """Best-effort ``.env`` loader (stdlib only, no python-dotenv dependency).
+
+    Shell-set variables win (``setdefault``), so a rollback like
+    ``$env:USE_FIXTURES="true"`` overrides the file without editing it.
+    """
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    if not env_path.exists():
+        return
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+
+
 def main(argv: list[str] | None = None) -> int:
+    _load_dotenv()
     parser = argparse.ArgumentParser(prog="extractors.run")
     parser.add_argument("names", nargs="*", help="extractor names to run")
     parser.add_argument(

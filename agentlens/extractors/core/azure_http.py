@@ -61,7 +61,12 @@ class AzureJsonSource:
                 return response.status, body, None
         except urllib.error.HTTPError as exc:
             retry_after = exc.headers.get("Retry-After") if exc.headers else None
-            return exc.code, {}, float(retry_after) if retry_after else None
+            raw = exc.read().decode("utf-8", errors="replace")
+            try:
+                error_body = json.loads(raw)
+            except ValueError:
+                error_body = {"_raw": raw}
+            return exc.code, error_body, float(retry_after) if retry_after else None
 
     def _get_with_headers(
         self, url: str, token: str
