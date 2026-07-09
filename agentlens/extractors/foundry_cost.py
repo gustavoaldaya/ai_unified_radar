@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
+from datetime import datetime, timezone
 
 from extractors.base import BaseExtractor, Page
 from extractors.core.azure_http import ARM_SCOPE, AzureJsonSource
@@ -38,6 +39,23 @@ _QUERY_BODY = {
         ],
     },
 }
+
+
+def _query_body(since: str | None) -> dict:
+    """``MonthToDate`` by default; a watermark cursor switches to a ``Custom``
+    window (``since``..today) so a rewound cursor actually backfills history."""
+    if since is None:
+        return _QUERY_BODY
+    start = str(since)[:10]
+    end = datetime.now(timezone.utc).date().isoformat()
+    return {
+        **_QUERY_BODY,
+        "timeframe": "Custom",
+        "timePeriod": {
+            "from": f"{start}T00:00:00+00:00",
+            "to": f"{end}T23:59:59+00:00",
+        },
+    }
 
 
 def _as_float(value: object) -> float | None:
@@ -111,7 +129,7 @@ class FoundryCostExtractor(AzureJsonSource, BaseExtractor):
             "/providers/Microsoft.CostManagement/query?api-version=2023-11-01"
         )
         self.rate_limit().before_request()
-        status, body, retry_after = self._post_json(url, token, _QUERY_BODY)
+        status, body, retry_after = self._post_json(url, token, _query_body(since))
         if status == 429:
             hint = f" Retry-After={retry_after:.0f}s." if retry_after else ""
             raise RuntimeError(
