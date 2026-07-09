@@ -10,3 +10,10 @@ __pycache__/
 # Local
 *.local.*
 .env
+
+# AgentLens: datos del tenant y artefactos locales - nunca al repo
+agentlens/star/m365_agents.json
+agentlens/star/m365_agents.failures.txt
+agentlens/star/*.db
+agentlens/_local_raw/
+uv.lock

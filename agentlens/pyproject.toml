@@ -1,0 +1,53 @@
+# AgentLens — extractor tier (subproject of gustavoaldaya/ai_unified_radar, ADR-009)
+# Recreated 2026-07-02: the B1 scaffold's pyproject never landed on disk (only the
+# inner agentlens/ content did), so `uv sync` had nothing to resolve.
+#
+# Usage:
+#   uv sync                       # create .venv with runtime + live + dev deps
+#   uv run python validate_credentials.py
+#   uv run python -m extractors.run --all
+#   uv run pytest / ruff check . / mypy --strict extractors schemas
+
+[project]
+name = "agentlens"
+version = "0.4.0a0"
+description = "AgentLens — unified AI-agent observability & FinOps: extractor tier"
+requires-python = ">=3.12"
+dependencies = [
+    # runtime (fixtures + live)
+    "pydantic>=2.7",
+    "pyarrow>=16",
+	"psycopg2-binary>=2.9",
+    "opentelemetry-sdk>=1.25",
+    # live cutover (lazy-imported; needed for validate_credentials + USE_FIXTURES=false)
+    "azure-identity>=1.17",
+    "azure-storage-file-datalake>=12.15",
+    "boto3>=1.34",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+# Star loader (star/build_star_pg.py): only needed to sink the raw parquets
+# into PostgreSQL. Kept out of the runtime group so the extractors stay lean.
+star = [
+    "psycopg2-binary>=2.9",
+]
+
+[tool.uv]
+# Script-style layout (top-level `extractors/` + `schemas/`), not an installable dist.
+package = false
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
