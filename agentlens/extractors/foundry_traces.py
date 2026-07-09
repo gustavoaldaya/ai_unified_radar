@@ -52,11 +52,18 @@ def build_kql(since: str | None) -> str:
     return f"""
 AppDependencies
 | where {window}
-| where isnotempty(Properties["gen_ai.system"]) and isnotempty(Id)
+| where isnotempty(Id)
+| where isnotempty(Properties["gen_ai.system"])
+      or isnotempty(Properties["gen_ai.agent.id"])
+      or tostring(Properties["gen_ai.operation.name"]) in ("invoke_agent", "create_agent")
 | project
     span_id           = tostring(Id),
     trace_id          = tostring(OperationId),
+    parent_span_id    = tostring(ParentId),
     timestamp         = tostring(TimeGenerated),
+    caller_id         = tostring(coalesce(
+                            column_ifexists("UserAuthenticatedId", ""),
+                            column_ifexists("UserId", ""))),
     gen_ai_agent_id   = tostring(coalesce(
                             Properties["gen_ai.agent.id"],
                             Properties["gen_ai.assistant.id"])),

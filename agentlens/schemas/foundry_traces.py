@@ -10,9 +10,11 @@ from schemas.base import RawRecord
 class RawFoundryTrace(RawRecord):
     span_id: str
     trace_id: str | None = None
+    parent_span_id: str | None = None
     timestamp: str | None = None
     gen_ai_agent_id: str | None = None
     gen_ai_agent_name: str | None = None
+    caller_id: str | None = None
     span_kind: str | None = None
     model_name: str | None = None
     model_version: str | None = None
