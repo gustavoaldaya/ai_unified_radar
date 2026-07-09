@@ -88,9 +88,15 @@ COST_SOURCES = [
     {"glob": "bedrock/cost/dt=*/*.parquet", "cloud": "aws"},
 ]
 
+# Purview Audit.General events -> fact_agent_audit (event grain, ADR-005
+# governance lens). Agent join is DIRECT: TargetPlatformAgentId is the Agent
+# 365 packageId = dim_agent.native_agent_id (cloud m365). No bridge.
+AUDIT_GLOB = "m365/purview/audit_log/dt=*/*.parquet"
+
 _ALL_TABLES = (
     "etl_load_log",
     "fact_resource_cost",
+    "fact_agent_audit",
     "fact_agent_traces",
     "fact_agent_snapshot",
     "fact_agent_consumption",
@@ -99,6 +105,7 @@ _ALL_TABLES = (
     "dim_agent",
     "dim_skill",
     "dim_connector",
+    "dim_user",
     "dim_model",
     "dim_metric",
     "dim_date",
@@ -122,6 +129,19 @@ def _hash(text: str | None) -> str | None:
     if not text:
         return None
     return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:16]
+
+
+def _json_or_none(value: Any) -> str | None:
+    """JSON text for non-empty containers; None for '', '[]', '{}' and None.
+    Keeps governance columns NULL-when-empty so reporting filters cheaply."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped if stripped not in ("", "[]", "{}", "null") else None
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False) if value else None
+    return str(value)
 
 
 def _dotnet_date(value: Any) -> str | None:
@@ -275,6 +295,7 @@ class StarBuilder:
         self._agents: dict[tuple[str, str], int] = {}
         self._skills: dict[str, int] = {}
         self._connectors: dict[str, int] = {}
+        self._users: dict[str, int] = {}
         self._models: dict[tuple[str, str], int] = {}
         self._metrics: dict[tuple[str, str, str], int] = {}
         self._dates: set[int] = set()
@@ -282,6 +303,8 @@ class StarBuilder:
         self._consumption: list[tuple] = []
         # span-grain rows staged for fact_agent_traces (ADR-010)
         self._traces: list[tuple] = []
+        # event-grain rows staged for fact_agent_audit (ADR-005)
+        self._audit: list[tuple] = []
         # identity bridge (ADR-010): (id_namespace, base native id) -> agent_key
         self._bridge: dict[tuple[str, str], int] = {}
         self.cur.execute("SELECT to_regclass(%s)", (f"{schema}.bridge_agent_identity",))
@@ -377,6 +400,12 @@ class StarBuilder:
         return self._simple_dim_key(
             "dim_connector", self._connectors, name,
             ("connector_name",), (name,), ("connector_name",), "connector_key",
+        )
+
+    def user_key(self, upn: str) -> int:
+        return self._simple_dim_key(
+            "dim_user", self._users, upn,
+            ("upn",), (upn,), ("upn",), "user_key",
         )
 
     def model_key(self, cloud: str, native_id: str) -> int:
@@ -675,6 +704,84 @@ class StarBuilder:
         )
         return len(rows)
 
+    def load_audit(self, raw_root: str) -> int:
+        """Purview Audit.General events -> ``fact_agent_audit`` (event grain).
+
+        Agent resolution: TargetPlatformAgentId ('T_...'/'P_...') IS the Agent
+        365 packageId and joins ``dim_agent.native_agent_id`` (cloud m365)
+        directly -> tier 'native'. Unresolved ids (BuiltIn_*, OutlookDraft,
+        deleted agents) keep the raw id/name in the fact and fall to the m365
+        sentinel -> governance signal, not an error. The audit feed NEVER
+        creates dim_agent rows: the catalog is the SSoT.
+
+        Reads governance fields from the CopilotEventData preserved in
+        ``_drift`` (works on captures both before and after the extractor's
+        app_identity v2 mapping fix)."""
+        self.cur.execute(
+            "SELECT to_regclass(%s)", (f"{self.schema}.fact_agent_audit",)
+        )
+        if self.cur.fetchone()[0] is None:
+            print("[star:pg] WARN fact_agent_audit missing -- "
+                  "run --apply-schema once; audit load skipped")
+            return 0
+        rows = list(self.iter_rows(raw_root, AUDIT_GLOB))
+        if not rows:
+            return 0
+        self.cur.execute(
+            f"SELECT native_agent_id, agent_key FROM {self.schema}.dim_agent "
+            "WHERE cloud = 'm365'"
+        )
+        catalog = {nid: int(key) for nid, key in self.cur.fetchall()}
+        sentinel = self.agent_key("m365", UNATTRIBUTED, agent_name=None)
+        staged = 0
+        for row in rows:
+            record_id = _text(row.get("record_id"))
+            ts = _text(row.get("creation_date"))
+            if record_id is None or ts is None:
+                continue
+            ced: dict = {}
+            drift = row.get("_drift")
+            if drift:
+                try:
+                    ced = json.loads(drift).get("CopilotEventData") or {}
+                except (ValueError, TypeError, AttributeError):
+                    ced = {}
+            native_id = (
+                _text(row.get("app_identity"))
+                or _text(ced.get("AppIdentity"))
+                or _text(ced.get("TargetPlatformAgentId"))
+            )
+            agent_key = catalog.get(native_id) if native_id else None
+            tier = "native" if agent_key is not None else "unattributed"
+            upn = _text(row.get("user_id"))
+            deferred = ced.get("DLPEvaluationDeferred")
+            self._audit.append((
+                record_id,
+                # CreationTime llega como UTC naive -- fija el offset para que
+                # un servidor PG en otra tz no desplace el dia.
+                ts if ts.endswith("Z") else ts + "Z",
+                self.date_key(ts),
+                agent_key if agent_key is not None else sentinel,
+                self.user_key(upn) if upn else None,
+                _text(row.get("record_type")),
+                _text(row.get("operation")),
+                _text(row.get("workload")),
+                _text(ced.get("AppHost")) or _text(ced.get("ChannelName")),
+                _text(ced.get("ThreadId")),
+                native_id,
+                _text(ced.get("TargetAgentName")),
+                _text(ced.get("PlatformAgentType")),
+                _text(ced.get("ErrorType")),
+                None if deferred is None else int(deferred),
+                _json_or_none(row.get("dlp_matches")),
+                _text(ced.get("SensitivityLabelId")),
+                _json_or_none(row.get("sensitivity_labels")),
+                _json_or_none(ced.get("GuardrailDetails")),
+                tier,
+            ))
+            staged += 1
+        return staged
+
     def flush_load_log(self) -> tuple[int, int]:
         """Persist newly loaded file paths into etl_load_log (same transaction
         as the data). Returns (new_files, skipped_files)."""
@@ -736,6 +843,32 @@ class StarBuilder:
             """,
             rows, page_size=1000,
         )
+        return len(rows)
+
+    def flush_audit(self) -> int:
+        """Bulk-upsert the staged event-grain rows into ``fact_agent_audit``."""
+        if not self._audit:
+            return 0
+        by_pk = {r[0]: r for r in self._audit}
+        rows = list(by_pk.values())
+        psycopg2.extras.execute_values(
+            self.cur,
+            f"""
+            INSERT INTO {self.schema}.fact_agent_audit
+                (record_id, ts, date_key, agent_key, user_key, record_type,
+                 operation, workload, app_host, thread_id, native_agent_id,
+                 agent_name_raw, platform_agent_type, error_type,
+                 dlp_evaluation_deferred, dlp_matches, sensitivity_label_id,
+                 sensitivity_labels, guardrail_details, resolution_tier)
+            VALUES %s
+            ON CONFLICT (record_id) DO UPDATE SET
+                agent_key       = EXCLUDED.agent_key,
+                user_key        = EXCLUDED.user_key,
+                resolution_tier = EXCLUDED.resolution_tier
+            """,
+            rows, page_size=1000,
+        )
+        self._audit.clear()
         return len(rows)
 
     def rebuild_snapshot(self) -> int:
@@ -812,6 +945,28 @@ def validate(conn: psycopg2.extensions.connection, schema: str) -> list[str]:
                 f"LEFT JOIN {schema}.dim_date d USING (date_key) "
                 "WHERE d.date_key IS NULL",
             ))
+        cur.execute("SELECT to_regclass(%s)", (f"{schema}.fact_agent_audit",))
+        if cur.fetchone()[0] is not None:
+            checks.extend([
+                (
+                    "audit agent",
+                    f"SELECT COUNT(*) FROM {schema}.fact_agent_audit f "
+                    f"LEFT JOIN {schema}.dim_agent d USING (agent_key) "
+                    "WHERE d.agent_key IS NULL",
+                ),
+                (
+                    "audit date",
+                    f"SELECT COUNT(*) FROM {schema}.fact_agent_audit f "
+                    f"LEFT JOIN {schema}.dim_date d USING (date_key) "
+                    "WHERE d.date_key IS NULL",
+                ),
+                (
+                    "audit user",
+                    f"SELECT COUNT(*) FROM {schema}.fact_agent_audit f "
+                    f"LEFT JOIN {schema}.dim_user u USING (user_key) "
+                    "WHERE f.user_key IS NOT NULL AND u.user_key IS NULL",
+                ),
+            ])
         for name, sql in checks:
             cur.execute(sql)
             (count,) = cur.fetchone()
@@ -825,10 +980,10 @@ def _counts(conn: psycopg2.extensions.connection, schema: str) -> dict[str, int]
     with conn.cursor() as cur:
         # ordered for readability, dims first then facts
         for table in (
-            "dim_agent", "dim_skill", "dim_connector", "dim_model", "dim_metric",
-            "dim_date", "bridge_agent_skill", "bridge_agent_connector",
-            "fact_agent_traces", "fact_agent_consumption", "fact_agent_snapshot",
-            "fact_resource_cost", "etl_load_log",
+            "dim_agent", "dim_skill", "dim_connector", "dim_user", "dim_model",
+            "dim_metric", "dim_date", "bridge_agent_skill", "bridge_agent_connector",
+            "fact_agent_traces", "fact_agent_audit", "fact_agent_consumption",
+            "fact_agent_snapshot", "fact_resource_cost", "etl_load_log",
         ):
             cur.execute("SELECT to_regclass(%s)", (f"{schema}.{table}",))
             if cur.fetchone()[0] is None:
@@ -878,7 +1033,9 @@ def main(argv: list[str] | None = None) -> int:
         attributed = b.load_traces(args.raw_root)
         unattributed = b.load_metrics(args.raw_root)
         cost_rows = b.load_cost(args.raw_root)
+        audit_staged = b.load_audit(args.raw_root)
         trace_rows = b.flush_traces()
+        audit_rows = b.flush_audit()
         facts_written = b.flush_consumption()
         snapshots = b.rebuild_snapshot()
         new_files, skipped_files = b.flush_load_log()
@@ -899,6 +1056,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  consumption upsert: {facts_written} rows written to fact_agent_consumption")
     print(f"  snapshot rows:      {snapshots}")
     print(f"  cost rows:          {cost_rows} upserted into fact_resource_cost")
+    print(f"  audit events:       {audit_staged} staged, "
+          f"{audit_rows} upserted into fact_agent_audit")
     print(f"  parquet files:      {new_files} new, {skipped_files} already loaded")
     for table, count in counts.items():
         print(f"  {table:<24} {count}")
