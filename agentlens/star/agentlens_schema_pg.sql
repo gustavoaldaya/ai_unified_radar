@@ -247,8 +247,10 @@ ALTER TABLE agentlens.fact_resource_cost
 -- =====================================================================
 
 -- FinOps: coste-por-agente por reparto de cuota de tokens (marcado allocated).
--- Coste vacio hasta que ext-foundry-cost cargue fact_resource_cost; las cuotas
--- de tokens ya son reales. chargeback_eligible = solo tiers native/bridge.
+-- La rama 'unallocated' anade el remanente diario que ningun agente absorbe
+-- (dias sin tokens atribuidos, o resto por redondeo): agent_key NULL y
+-- cost_basis 'unallocated', de modo que la suma de la vista cuadra EXACTA
+-- con fact_resource_cost. chargeback_eligible = solo tiers native/bridge.
 CREATE OR REPLACE VIEW agentlens.v_finops_agent_cost AS
 WITH agent_day AS (
     SELECT t.agent_key, t.date_key,
@@ -263,17 +265,32 @@ day_tokens AS (SELECT date_key, SUM(tokens) AS total_tokens FROM agent_day GROUP
 day_cost AS (
     SELECT date_key, SUM(COALESCE(effective_cost, billed_cost, 0)) AS cost, MAX(currency) AS currency
     FROM agentlens.fact_resource_cost GROUP BY date_key
+),
+allocated AS (
+    SELECT ad.agent_key, a.agent_name, ad.date_key, ad.tokens, ad.invocations,
+           ad.chargeback_eligible, dt.total_tokens, dc.cost AS day_resource_cost, dc.currency,
+           CASE WHEN dt.total_tokens > 0
+                THEN ROUND(((ad.tokens::numeric / dt.total_tokens) * COALESCE(dc.cost,0))::numeric, 6)
+                ELSE 0 END AS allocated_cost,
+           'allocated'::text AS cost_basis
+    FROM agent_day ad
+    JOIN agentlens.dim_agent a ON a.agent_key = ad.agent_key
+    JOIN day_tokens dt ON dt.date_key = ad.date_key
+    LEFT JOIN day_cost dc ON dc.date_key = ad.date_key
 )
-SELECT ad.agent_key, a.agent_name, ad.date_key, ad.tokens, ad.invocations,
-       ad.chargeback_eligible, dt.total_tokens, dc.cost AS day_resource_cost, dc.currency,
-       CASE WHEN dt.total_tokens > 0
-            THEN ROUND(((ad.tokens::numeric / dt.total_tokens) * COALESCE(dc.cost,0))::numeric, 6)
-            ELSE 0 END AS allocated_cost,
-       'allocated'::text AS cost_basis
-FROM agent_day ad
-JOIN agentlens.dim_agent a ON a.agent_key = ad.agent_key
-JOIN day_tokens dt ON dt.date_key = ad.date_key
-LEFT JOIN day_cost dc ON dc.date_key = ad.date_key;
+SELECT * FROM allocated
+UNION ALL
+SELECT NULL::int AS agent_key, '(unallocated)' AS agent_name, dc.date_key,
+       NULL::bigint AS tokens, NULL::bigint AS invocations,
+       false AS chargeback_eligible, NULL::bigint AS total_tokens,
+       dc.cost AS day_resource_cost, dc.currency,
+       ROUND((dc.cost - COALESCE(al.sum_alloc, 0))::numeric, 6) AS allocated_cost,
+       'unallocated'::text AS cost_basis
+FROM day_cost dc
+LEFT JOIN (
+    SELECT date_key, SUM(allocated_cost) AS sum_alloc FROM allocated GROUP BY date_key
+) al USING (date_key)
+WHERE dc.cost - COALESCE(al.sum_alloc, 0) > 0.0000005;
 
 -- =====================================================================
 -- Purview audit lens (ADR-005) -- 2026-07-09

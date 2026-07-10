@@ -46,6 +46,7 @@ import psycopg2
 import psycopg2.extras
 
 UNATTRIBUTED = "(unattributed)"
+NULL_OWNER_GUID = "00000000-0000-0000-0000-000000000000"
 UNKNOWN_MODEL = "(unknown)"
 
 _SCHEMA_SQL_PATH = os.path.join(os.path.dirname(__file__), "agentlens_schema_pg.sql")
@@ -472,10 +473,29 @@ class StarBuilder:
             packages = data.get("value", [data])
         else:
             packages = data
+        # Ghost dedupe: el catalogo puede traer re-registros HUECOS del mismo
+        # agente (ownerId = GUID nulo, sin publisher, un solo element vacio)
+        # junto al paquete real. Se salta un paquete owner-nulo SOLO si existe
+        # otro con el mismo (displayName, platform) y owner real -- 161 agentes
+        # de sistema llevan owner nulo legitimamente y NO tienen gemelo, asi
+        # que cargan normal. Sin esto, los fantasmas reaparecen en cada load.
+        real_owner_names = {
+            (_text(p.get("displayName")), _text(p.get("platform")))
+            for p in packages or []
+            if _text(p.get("ownerId")) not in (None, NULL_OWNER_GUID)
+        }
         agents = 0
+        ghosts = 0
         for pkg in packages or []:
             native_id = _text(pkg.get("id"))
             if native_id is None:
+                continue
+            if (
+                _text(pkg.get("ownerId")) == NULL_OWNER_GUID
+                and (_text(pkg.get("displayName")), _text(pkg.get("platform")))
+                in real_owner_names
+            ):
+                ghosts += 1
                 continue
             instructions, capabilities, actions = _parse_definition(pkg)
             description = _text(pkg.get("longDescription")) or _text(pkg.get("shortDescription"))
@@ -507,6 +527,9 @@ class StarBuilder:
                     (agent_key, self.connector_key(act)),
                 )
             agents += 1
+        if ghosts:
+            print(f"[star:pg] registry: skipped {ghosts} ghost package(s) "
+                  "(null-GUID owner with a real-owner twin)")
         return agents
 
     def _stage(
