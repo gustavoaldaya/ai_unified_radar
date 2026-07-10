@@ -152,7 +152,7 @@ def _resolve_base(ext, token: str) -> str:
 
 
 def _create_query(ext, token: str, base: str, service: str,
-                  start: date, end: date) -> str:
+                  start: date, end: date) -> str | None:
     payload = {
         "@odata.type": "#microsoft.graph.security.auditLogQuery",
         "displayName": f"agentlens-backfill-{service.lower()}-{start.isoformat()}",
@@ -165,6 +165,12 @@ def _create_query(ext, token: str, base: str, service: str,
     if status in (200, 201):
         return str(body["id"])
     detail = json.dumps(body)[:400]
+    if status == 429:
+        # throttling agotado: no tirar el run; el chunk queda sin crear y el
+        # siguiente barrido lo reintenta (state.get(key) sigue siendo None).
+        print(f"[backfill-audit] 429 persistente creando {service}|{start}; "
+              "se reintenta en el proximo barrido", file=sys.stderr)
+        return None
     if status in (401, 403):
         raise SystemExit(
             f"[backfill-audit] HTTP {status} creando la query: la app necesita "
@@ -289,6 +295,8 @@ def main() -> int:
             if state.get(key) is not None or active >= MAX_ACTIVE_QUERIES:
                 continue
             qid = _create_query(ext, token, base, svc, cs, ce)
+            if qid is None:
+                continue
             state.put(key, {"id": qid, "status": "notStarted", "done": False,
                             "range": [cs.isoformat(), ce.isoformat()]})
             active += 1
