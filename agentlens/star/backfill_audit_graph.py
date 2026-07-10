@@ -24,7 +24,9 @@ El solape con lo ya cargado es inocuo: ``fact_agent_audit`` dedupe por
 Estado resumible en ``raw/_watermarks/ext-purview-audit-backfill.json``
 (query ids por chunk). Re-ejecutar retoma el polling y la descarga sin
 recrear queries; borrar una entrada del JSON fuerza su re-creacion.
-No toca el watermark del extractor incremental.
+Al arrancar se reconcilia con el servidor (adopta queries
+agentlens-backfill-* existentes por displayName). No toca el watermark
+del extractor incremental.
 
 Uso (desde agentlens/):
     uv run python .\\star\\backfill_audit_graph.py                     # 180 dias
@@ -149,6 +151,51 @@ def _resolve_base(ext, token: str) -> str:
         "de conceder, el backend de audit puede tardar 15-30 min en "
         "propagarlo: reintentar mas tarde sin tocar nada."
     )
+
+
+def _adopt_existing(ext, token: str, base: str, state: _State,
+                    services: list[str]) -> None:
+    """Reconcilia con el servidor antes de crear nada.
+
+    Adopta al estado las queries ``agentlens-backfill-*`` que ya existan
+    (runs anteriores o cancelados) para no recrearlas -- los jobs siguen
+    corriendo en el servidor aunque el cliente muera -- e imprime el
+    inventario de jobs: la cuota de busquedas concurrentes por principal
+    es la causa tipica de 429 persistentes en la creacion.
+    """
+    canonical = {s.lower(): s for s in services}
+    url: str | None = f"{base}?$top=100"
+    adopted = total = non_terminal = 0
+    while url:
+        status, body = _graph(ext._get_json, url, token)
+        if status != 200:
+            print(f"[backfill-audit] WARN no se pudo listar queries "
+                  f"(HTTP {status}); sigo sin reconciliar", file=sys.stderr)
+            return
+        for q in body.get("value") or []:
+            total += 1
+            if str(q.get("status")) not in TERMINAL:
+                non_terminal += 1
+            name = str(q.get("displayName") or "")
+            if not name.startswith("agentlens-backfill-"):
+                continue
+            rest = name[len("agentlens-backfill-"):]
+            day, svc_lower = rest[-10:], rest[:-11]
+            svc = canonical.get(svc_lower)
+            if svc is None:
+                continue
+            key = f"{svc}|{day}"
+            if state.get(key) is None:
+                state.put(key, {"id": str(q.get("id")),
+                                "status": str(q.get("status")),
+                                "done": False, "adopted": True})
+                adopted += 1
+                print(f"[backfill-audit] adoptada {key} (ya existia en el "
+                      f"servidor, status={q.get('status')})", file=sys.stderr)
+        url = body.get("@odata.nextLink")
+    print(f"[backfill-audit] inventario servidor: {total} queries de audit "
+          f"({non_terminal} no terminales); {adopted} adoptadas al estado",
+          file=sys.stderr)
 
 
 def _create_query(ext, token: str, base: str, service: str,
@@ -278,6 +325,7 @@ def main() -> int:
 
     token = ext._aad_token(GRAPH_SCOPE)
     base = _resolve_base(ext, token)
+    _adopt_existing(ext, token, base, state, services)
 
     deadline = time.monotonic() + args.max_wait_minutes * 60.0
     total_events = 0
@@ -289,18 +337,20 @@ def main() -> int:
             if (entry := state.get(f"{_svc}|{cs.isoformat()}")) is not None
             and entry.get("id") and entry.get("status") not in TERMINAL
         )
-        # crear queries que falten, respetando el tope de concurrencia
+        # crear queries que falten: como mucho UNA por barrido (el servicio
+        # limita el ritmo de creacion; los jobs ya creados corren en paralelo)
         for svc, cs, ce in keys:
             key = f"{svc}|{cs.isoformat()}"
             if state.get(key) is not None or active >= MAX_ACTIVE_QUERIES:
                 continue
             qid = _create_query(ext, token, base, svc, cs, ce)
             if qid is None:
-                continue
+                break  # 429 agotado: no insistir con mas creaciones este barrido
             state.put(key, {"id": qid, "status": "notStarted", "done": False,
                             "range": [cs.isoformat(), ce.isoformat()]})
             active += 1
             print(f"[backfill-audit] creada {key} -> {qid}", file=sys.stderr)
+            break  # una creacion por barrido
 
         pending = [(svc, cs) for svc, cs, _ce in keys
                    if (e := state.get(f"{svc}|{cs.isoformat()}")) is None
