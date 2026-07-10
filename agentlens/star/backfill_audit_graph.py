@@ -74,7 +74,10 @@ _load_env(_ROOT)
 from extractors.core.azure_http import GRAPH_SCOPE  # noqa: E402
 from extractors.purview_audit import PurviewAuditExtractor, _to_record  # noqa: E402
 
-GRAPH_QUERIES = "https://graph.microsoft.com/v1.0/security/auditLog/queries"
+GRAPH_BASES = (
+    "https://graph.microsoft.com/v1.0/security/auditLog/queries",
+    "https://graph.microsoft.com/beta/security/auditLog/queries",
+)
 STATE_PATH = "_watermarks/ext-purview-audit-backfill.json"
 TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
 MAX_ACTIVE_QUERIES = 8  # el servicio limita las busquedas concurrentes
@@ -122,7 +125,34 @@ def _graph(call, *args, attempts: int = 5):
     return status, body  # ultimo intento, que decida el llamador
 
 
-def _create_query(ext, token: str, service: str, start: date, end: date) -> str:
+def _resolve_base(ext, token: str) -> str:
+    """Elige v1.0 o beta sondeando el listado de queries (GET) antes de crear.
+
+    Observado 2026-07-10: POST /v1.0/security/auditLog/queries devuelve 404
+    UnknownError en tenants donde beta funciona -- Learn aun referencia la
+    Audit Search Graph API en beta y el rollout de v1.0 va por detras.
+    Ademas, tras conceder AuditLogsQuery.Read.All el backend de audit puede
+    tardar ~15-30 min en reconocer al service principal (403/404
+    transitorios con el mismo aspecto).
+    """
+    last: tuple | None = None
+    for base in GRAPH_BASES:
+        status, body = _graph(ext._get_json, f"{base}?$top=1", token)
+        if status == 200:
+            print(f"[backfill-audit] endpoint activo: {base}", file=sys.stderr)
+            return base
+        last = (base, status, json.dumps(body)[:300])
+        print(f"[backfill-audit] sonda {base} -> HTTP {status}", file=sys.stderr)
+    raise SystemExit(
+        "[backfill-audit] ningun endpoint de auditLog/queries responde "
+        f"(ultimo: {last}). Si el permiso AuditLogsQuery.Read.All se acaba "
+        "de conceder, el backend de audit puede tardar 15-30 min en "
+        "propagarlo: reintentar mas tarde sin tocar nada."
+    )
+
+
+def _create_query(ext, token: str, base: str, service: str,
+                  start: date, end: date) -> str:
     payload = {
         "@odata.type": "#microsoft.graph.security.auditLogQuery",
         "displayName": f"agentlens-backfill-{service.lower()}-{start.isoformat()}",
@@ -131,7 +161,7 @@ def _create_query(ext, token: str, service: str, start: date, end: date) -> str:
         "filterEndDateTime": f"{(end + timedelta(days=1)).isoformat()}T00:00:00Z",
         "serviceFilter": service,
     }
-    status, body = _graph(ext._post_json, GRAPH_QUERIES, token, payload)
+    status, body = _graph(ext._post_json, base, token, payload)
     if status in (200, 201):
         return str(body["id"])
     detail = json.dumps(body)[:400]
@@ -144,14 +174,14 @@ def _create_query(ext, token: str, service: str, start: date, end: date) -> str:
     raise RuntimeError(f"crear query fallo: HTTP {status}: {detail}")
 
 
-def _poll_status(ext, token: str, query_id: str) -> str:
-    status, body = _graph(ext._get_json, f"{GRAPH_QUERIES}/{query_id}", token)
+def _poll_status(ext, token: str, base: str, query_id: str) -> str:
+    status, body = _graph(ext._get_json, f"{base}/{query_id}", token)
     if status != 200:
         raise RuntimeError(f"poll de {query_id} fallo: HTTP {status}")
     return str(body.get("status") or "unknown")
 
 
-def _download(ext, token: str, query_id: str) -> list[dict]:
+def _download(ext, token: str, base: str, query_id: str) -> list[dict]:
     """Pagina los records del job y los mapea con el _to_record del extractor.
 
     Graph envuelve el evento original (PascalCase, mismo shape que los blobs
@@ -159,7 +189,7 @@ def _download(ext, token: str, query_id: str) -> list[dict]:
     fallbacks (id, createdDateTime, service, userPrincipalName).
     """
     mapped: list[dict] = []
-    url: str | None = f"{GRAPH_QUERIES}/{query_id}/records?$top=999"
+    url: str | None = f"{base}/{query_id}/records?$top=999"
     page = 0
     while url:
         status, body = _graph(ext._get_json, url, token)
@@ -240,6 +270,9 @@ def main() -> int:
     print(f"[backfill-audit] rango {d_from}..{d_to} | {len(chunks)} chunks x "
           f"{len(services)} servicios = {len(keys)} queries", file=sys.stderr)
 
+    token = ext._aad_token(GRAPH_SCOPE)
+    base = _resolve_base(ext, token)
+
     deadline = time.monotonic() + args.max_wait_minutes * 60.0
     total_events = 0
     failed: list[str] = []
@@ -255,7 +288,7 @@ def main() -> int:
             key = f"{svc}|{cs.isoformat()}"
             if state.get(key) is not None or active >= MAX_ACTIVE_QUERIES:
                 continue
-            qid = _create_query(ext, token, svc, cs, ce)
+            qid = _create_query(ext, token, base, svc, cs, ce)
             state.put(key, {"id": qid, "status": "notStarted", "done": False,
                             "range": [cs.isoformat(), ce.isoformat()]})
             active += 1
@@ -272,13 +305,13 @@ def main() -> int:
             entry = state.get(key)
             if entry is None:  # aun sin crear (tope de concurrencia)
                 continue
-            status = _poll_status(ext, token, entry["id"])
+            status = _poll_status(ext, token, base, entry["id"])
             if status != entry.get("status"):
                 entry = {**entry, "status": status}
                 state.put(key, entry)
                 print(f"[backfill-audit] {key}: {status}", file=sys.stderr)
             if status == "succeeded":
-                records = _download(ext, token, entry["id"])
+                records = _download(ext, token, base, entry["id"])
                 count, files = _write_chunk(ext, records, svc, cs.isoformat())
                 total_events += count
                 state.put(key, {**entry, "done": True, "records": count,
