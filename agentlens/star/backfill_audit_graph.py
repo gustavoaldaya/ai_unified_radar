@@ -25,18 +25,23 @@ Estado resumible en ``raw/_watermarks/ext-purview-audit-backfill.json``
 (query ids por chunk). Re-ejecutar retoma el polling y la descarga sin
 recrear queries; borrar una entrada del JSON fuerza su re-creacion.
 Al arrancar se reconcilia con el servidor (adopta queries
-agentlens-backfill-* existentes por displayName). No toca el watermark
-del extractor incremental.
+agentlens-backfill-* existentes por displayName). El polling/descarga
+cubre TODO el estado, no solo la rejilla del run actual: cambiar de
+--chunk-days/--from entre runs es seguro (las entradas de rejillas
+anteriores se drenan igualmente). No toca el watermark del extractor
+incremental.
 
 Throttling de creacion (observado 2026-07-10): el servicio limita el ritmo
-de creacion de queries con 429 SIN Retry-After y sin limite documentado.
-Estrategia: un solo POST por intento y cooldown adaptativo entre intentos
-(2 min -> x2 -> tope 30 min, reset al primer exito). Polling y descargas
-no se ven afectados.
+de creacion de queries con 429 SIN Retry-After y sin limite documentado
+(cuerpo: TooManyRequests generico a nivel tenant); la evidencia empirica
+apunta a creacion serializada/cuoteada muy baja. Estrategia: un solo POST
+por intento, cooldown adaptativo (2 min -> x2 -> tope 30 min, reset al
+primer exito) y REJILLAS GRANDES (pocos jobs): con creacion serializada,
+menos chunks = menos horas.
 
 Uso (desde agentlens/):
     uv run python .\\star\\backfill_audit_graph.py                     # 180 dias
-    uv run python .\\star\\backfill_audit_graph.py --from 2026-05-01 --to 2026-07-10
+    uv run python .\\star\\backfill_audit_graph.py --from 2026-01-26 --chunk-days 45
     uv run python .\\star\\backfill_audit_graph.py --chunk-days 10 --poll-interval 30
 Despues de terminar:
     uv run python .\\star\\build_star_pg.py       # carga los parquets nuevos
@@ -372,17 +377,18 @@ def main() -> int:
                     next_create_at = time.monotonic() + 60.0
                 break  # un intento de creacion por barrido
 
-        pending = [(svc, cs) for svc, cs, _ce in keys
-                   if (e := state.get(f"{svc}|{cs.isoformat()}")) is None
-                   or not e.get("done")]
-        if not pending:
+        missing = [1 for svc, cs, _ce in keys
+                   if state.get(f"{svc}|{cs.isoformat()}") is None]
+        # el polling/descarga cubre TODO el estado (incluidas entradas de
+        # rejillas anteriores o adoptadas): las rejillas son componibles
+        pending = [k for k, e in state.data["queries"].items()
+                   if not e.get("done")]
+        if not missing and not pending:
             break
 
-        for svc, cs in pending:
-            key = f"{svc}|{cs.isoformat()}"
+        for key in pending:
+            svc, _, day = key.partition("|")
             entry = state.get(key)
-            if entry is None:  # aun sin crear (tope de concurrencia)
-                continue
             status = _poll_status(ext, token, base, entry["id"])
             if status != entry.get("status"):
                 entry = {**entry, "status": status}
@@ -390,7 +396,7 @@ def main() -> int:
                 print(f"[backfill-audit] {key}: {status}", file=sys.stderr)
             if status == "succeeded":
                 records = _download(ext, token, base, entry["id"])
-                count, files = _write_chunk(ext, records, svc, cs.isoformat())
+                count, files = _write_chunk(ext, records, svc, day)
                 total_events += count
                 state.put(key, {**entry, "done": True, "records": count,
                                 "files": files})
@@ -402,9 +408,11 @@ def main() -> int:
                 print(f"[backfill-audit] WARN {key}: {status} (borrar su "
                       "entrada del state JSON para recrearla)", file=sys.stderr)
 
-        pending = [(svc, cs) for svc, cs, _ce in keys
-                   if not (state.get(f"{svc}|{cs.isoformat()}") or {}).get("done")]
-        if not pending:
+        missing = [1 for svc, cs, _ce in keys
+                   if state.get(f"{svc}|{cs.isoformat()}") is None]
+        pending = [k for k, e in state.data["queries"].items()
+                   if not e.get("done")]
+        if not missing and not pending:
             break
         if time.monotonic() > deadline:
             print("[backfill-audit] max-wait alcanzado; estado persistido -- "
