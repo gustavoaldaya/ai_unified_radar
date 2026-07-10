@@ -1,0 +1,70 @@
+/// AgentLens - medidas del modelo (CFO FinOps + CIO Gobierno)
+/// Pegar en la vista TMDL de Power BI Desktop y aplicar.
+/// Requiere las tablas renombradas segun powerbi/README.md paso 2.
+createOrReplace
+
+	table _Medidas
+
+		measure 'Coste recurso (EUR)' = SUMX(fact_resource_cost, COALESCE(fact_resource_cost[effective_cost], fact_resource_cost[billed_cost], 0))
+			formatString: #,0.00 €
+
+		measure 'Coste asignado (EUR)' = CALCULATE(SUM(v_finops_cost_allocation[allocated_cost]), v_finops_cost_allocation[cost_basis] = "allocated")
+			formatString: #,0.00 €
+
+		measure 'Coste sin asignar (EUR)' = CALCULATE(SUM(v_finops_cost_allocation[allocated_cost]), v_finops_cost_allocation[cost_basis] = "unallocated")
+			formatString: #,0.00 €
+
+		measure '% coste asignado' = DIVIDE([Coste asignado (EUR)], [Coste asignado (EUR)] + [Coste sin asignar (EUR)])
+			formatString: 0.0%
+
+		measure Tokens = SUM(v_finops_cost_allocation[tokens])
+			formatString: #,0
+
+		measure 'Tokens (M)' = DIVIDE([Tokens], 1000000)
+			formatString: #,0.00
+
+		measure Invocaciones = SUM(v_finops_cost_allocation[invocations])
+			formatString: #,0
+
+		measure 'EUR por 1M tokens' = DIVIDE([Coste asignado (EUR)], [Tokens]) * 1000000
+			formatString: #,0.00 €
+
+		measure 'EUR por invocacion' = DIVIDE([Coste asignado (EUR)], [Invocaciones])
+			formatString: #,0.0000 €
+
+		measure 'Eventos de uso' = SUM(v_usage_daily[events])
+			formatString: #,0
+
+		measure 'Usuarios activos' = DISTINCTCOUNT(v_usage_daily[user_key])
+			formatString: #,0
+
+		measure 'Eventos DLP diferidos' = SUM(v_usage_daily[dlp_deferred_events])
+			formatString: #,0
+
+		measure 'Errores de trazas' = SUM(v_traces_daily[error_spans])
+			formatString: #,0
+
+		measure 'Agentes catalogo' = COUNTROWS(v_cio_agent_scorecard)
+			formatString: #,0
+
+		measure 'Agentes con uso' = CALCULATE(COUNTROWS(v_cio_agent_scorecard), v_cio_agent_scorecard[has_usage_signal] = TRUE())
+			formatString: #,0
+
+		measure 'Candidatos a decomision' = CALCULATE(COUNTROWS(v_cio_agent_scorecard), v_cio_agent_scorecard[tier] = "DECOMMISSION_CANDIDATE")
+			formatString: #,0
+
+		measure 'Agentes en cluster' = CALCULATE(COUNTROWS(v_cio_agent_scorecard), v_cio_agent_scorecard[in_dup_cluster] = TRUE())
+			formatString: #,0
+
+		measure '% agentes sin uso' = 1 - DIVIDE([Agentes con uso], [Agentes catalogo])
+			formatString: 0.0%
+
+		column _
+			dataType: string
+			isHidden
+			summarizeBy: none
+			sourceColumn: _
+
+		partition _Medidas = calculated
+			mode: import
+			source = ROW("_", BLANK())

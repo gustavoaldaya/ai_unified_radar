@@ -357,3 +357,242 @@ FROM agentlens.fact_agent_traces t
 WHERE t.resolution_tier = 'unattributed'
 GROUP BY 1, 2
 ORDER BY tokens DESC;
+
+-- =====================================================================
+-- CAPA DE REPORTING (2026-07-10) -- contrato para Power BI
+--
+--   Vistas de solo lectura sobre el star; los facts no se tocan.
+--   Diseno PBIX: importar v_cio_agent_scorecard como dimension agente
+--   (excluye 'instructions' a proposito: tamano de modelo), dim_model,
+--   dim_user y las vistas fact. Calendario DAX relacionado por
+--   date_key (YYYYMMDD). Kit completo en agentlens/powerbi/.
+--
+--   * v_finops_cost_allocation: asignacion de coste por share de tokens
+--     a grano (cloud, dia, agente, modelo). La cloud de matching es la
+--     del MODELO (runtime que factura), NO la de dim_agent: el registro
+--     Agent 365 es federado y los agentes Foundry viven como cloud
+--     m365 en dim_agent. Linea 'unallocated' explicita por dia/cloud.
+--   * v_usage_daily: audit Purview a grano (dia, agente, usuario,
+--     record_type, tier). Proxy de uso M365 (getCopilotAgentUsage es
+--     techo de plataforma).
+--   * v_traces_daily: telemetria a grano (dia, agente, modelo, tier).
+--     error_spans = status HTTP 4xx/5xx.
+--   * v_finops_funnel_daily: funnel uso -> consumo -> coste por
+--     (dia, cloud) para la pagina CFO.
+--   * v_cio_agent_scorecard: 1 fila por agente de catalogo (excluye
+--     centinelas) con redundancia (cluster por config_hash exacto),
+--     uso (audit nativo + trazas native/bridge), coste asignado y tier
+--     KEEP / REVIEW / DECOMMISSION_CANDIDATE. El tier es PROVISIONAL
+--     mientras la ventana de audit sea corta (backfill Purview
+--     pendiente, retencion 180 dias en Audit Standard).
+--   * v_cio_dup_clusters: 1 fila por cluster de duplicados exactos.
+-- =====================================================================
+
+CREATE OR REPLACE VIEW agentlens.v_finops_cost_allocation AS
+WITH grain AS (
+    SELECT m.cloud,
+           t.agent_key,
+           t.model_key,
+           t.date_key,
+           sum(COALESCE(t.total_tokens, 0)) AS tokens,
+           count(*) FILTER (WHERE t.operation_name = 'invoke_agent') AS invocations
+    FROM agentlens.fact_agent_traces t
+    JOIN agentlens.dim_model m ON m.model_key = t.model_key
+    WHERE t.resolution_tier <> 'unattributed'
+    GROUP BY m.cloud, t.agent_key, t.model_key, t.date_key
+),
+day_tokens AS (
+    SELECT cloud, date_key, sum(tokens) AS total_tokens
+    FROM grain
+    GROUP BY cloud, date_key
+),
+day_cost AS (
+    SELECT cloud, date_key,
+           sum(COALESCE(effective_cost, billed_cost, 0)) AS cost,
+           max(currency) AS currency
+    FROM agentlens.fact_resource_cost
+    GROUP BY cloud, date_key
+),
+allocated AS (
+    SELECT g.cloud,
+           g.date_key,
+           g.agent_key,
+           g.model_key,
+           g.tokens,
+           g.invocations,
+           CASE WHEN dt.total_tokens > 0
+                THEN round(((g.tokens::numeric / dt.total_tokens)::double precision * COALESCE(dc.cost, 0::double precision))::numeric, 6)
+                ELSE 0::numeric
+           END AS allocated_cost,
+           dc.currency,
+           'allocated'::text AS cost_basis
+    FROM grain g
+    JOIN day_tokens dt ON dt.cloud = g.cloud AND dt.date_key = g.date_key
+    LEFT JOIN day_cost dc ON dc.cloud = g.cloud AND dc.date_key = g.date_key
+)
+SELECT cloud, date_key, agent_key, model_key, tokens, invocations,
+       allocated_cost, currency, cost_basis
+FROM allocated
+UNION ALL
+SELECT dc.cloud,
+       dc.date_key,
+       NULL::integer,
+       NULL::integer,
+       NULL::bigint,
+       NULL::bigint,
+       round((dc.cost - COALESCE(al.sum_alloc, 0::numeric)::double precision)::numeric, 6),
+       dc.currency,
+       'unallocated'::text
+FROM day_cost dc
+LEFT JOIN (
+    SELECT cloud, date_key, sum(allocated_cost) AS sum_alloc
+    FROM allocated
+    GROUP BY cloud, date_key
+) al ON al.cloud = dc.cloud AND al.date_key = dc.date_key
+WHERE (dc.cost - COALESCE(al.sum_alloc, 0::numeric)::double precision) > 0.0000005::double precision;
+
+CREATE OR REPLACE VIEW agentlens.v_usage_daily AS
+SELECT date_key,
+       agent_key,
+       user_key,
+       record_type,
+       resolution_tier,
+       count(*) AS events,
+       count(*) FILTER (WHERE error_type IS NOT NULL AND error_type <> '') AS error_events,
+       count(*) FILTER (WHERE dlp_evaluation_deferred = 1) AS dlp_deferred_events
+FROM agentlens.fact_agent_audit
+GROUP BY date_key, agent_key, user_key, record_type, resolution_tier;
+
+CREATE OR REPLACE VIEW agentlens.v_traces_daily AS
+SELECT t.date_key,
+       t.agent_key,
+       t.model_key,
+       t.resolution_tier,
+       count(*) AS spans,
+       count(*) FILTER (WHERE t.operation_name = 'invoke_agent') AS invocations,
+       count(*) FILTER (WHERE t.status ~ '^[45]') AS error_spans,
+       sum(COALESCE(t.input_tokens, 0)) AS input_tokens,
+       sum(COALESCE(t.output_tokens, 0)) AS output_tokens,
+       sum(COALESCE(t.total_tokens, 0)) AS total_tokens,
+       round(avg(t.duration_ms)::numeric, 2) AS avg_duration_ms
+FROM agentlens.fact_agent_traces t
+GROUP BY t.date_key, t.agent_key, t.model_key, t.resolution_tier;
+
+CREATE OR REPLACE VIEW agentlens.v_finops_funnel_daily AS
+WITH usage_d AS (
+    SELECT date_key,
+           'm365'::text AS cloud,
+           count(*) AS audit_events,
+           count(DISTINCT user_key) AS audit_users
+    FROM agentlens.fact_agent_audit
+    GROUP BY date_key
+),
+traces_d AS (
+    SELECT t.date_key,
+           a.cloud,
+           count(*) FILTER (WHERE t.operation_name = 'invoke_agent') AS invocations,
+           sum(COALESCE(t.total_tokens, 0)) AS tokens
+    FROM agentlens.fact_agent_traces t
+    JOIN agentlens.dim_agent a ON a.agent_key = t.agent_key
+    GROUP BY t.date_key, a.cloud
+),
+cost_d AS (
+    SELECT date_key,
+           cloud,
+           sum(COALESCE(effective_cost, billed_cost, 0)) AS resource_cost,
+           max(currency) AS currency
+    FROM agentlens.fact_resource_cost
+    GROUP BY date_key, cloud
+)
+SELECT date_key,
+       cloud,
+       u.audit_events,
+       u.audit_users,
+       t.invocations,
+       t.tokens,
+       c.resource_cost,
+       c.currency
+FROM usage_d u
+FULL JOIN traces_d t USING (date_key, cloud)
+FULL JOIN cost_d c USING (date_key, cloud);
+
+CREATE OR REPLACE VIEW agentlens.v_cio_agent_scorecard AS
+WITH clusters AS (
+    SELECT config_hash, count(*) AS cluster_size
+    FROM agentlens.dim_agent
+    WHERE config_hash IS NOT NULL AND config_hash <> ''
+      AND native_agent_id <> '(unattributed)'
+    GROUP BY config_hash
+    HAVING count(*) > 1
+),
+audit_usage AS (
+    SELECT agent_key,
+           count(*) AS audit_events,
+           count(DISTINCT user_key) AS distinct_users,
+           max(ts) AS last_audit_ts
+    FROM agentlens.fact_agent_audit
+    WHERE resolution_tier = 'native'
+    GROUP BY agent_key
+),
+trace_usage AS (
+    SELECT agent_key,
+           count(*) FILTER (WHERE operation_name = 'invoke_agent') AS invocations,
+           sum(COALESCE(total_tokens, 0)) AS total_tokens,
+           max(ts) AS last_trace_ts
+    FROM agentlens.fact_agent_traces
+    WHERE resolution_tier IN ('native', 'bridge')
+    GROUP BY agent_key
+),
+alloc AS (
+    SELECT agent_key, sum(allocated_cost) AS allocated_cost
+    FROM agentlens.v_finops_cost_allocation
+    WHERE cost_basis = 'allocated'
+    GROUP BY agent_key
+)
+SELECT a.agent_key,
+       a.cloud,
+       a.native_agent_id,
+       a.agent_name,
+       a.agent_type,
+       a.publisher,
+       a.owner_id,
+       a.status,
+       a.enabled,
+       a.config_hash,
+       COALESCE(c.cluster_size, 1) AS cluster_size,
+       (c.config_hash IS NOT NULL) AS in_dup_cluster,
+       COALESCE(u.audit_events, 0) AS audit_events,
+       COALESCE(u.distinct_users, 0) AS distinct_users,
+       u.last_audit_ts,
+       COALESCE(t.invocations, 0) AS invocations,
+       COALESCE(t.total_tokens, 0) AS total_tokens,
+       t.last_trace_ts,
+       COALESCE(al.allocated_cost, 0) AS allocated_cost_eur,
+       (u.agent_key IS NOT NULL OR t.agent_key IS NOT NULL) AS has_usage_signal,
+       (COALESCE(u.distinct_users, 0) = 1) AS single_user,
+       CASE
+           WHEN u.agent_key IS NOT NULL OR t.agent_key IS NOT NULL THEN 'KEEP'
+           WHEN c.config_hash IS NOT NULL THEN 'DECOMMISSION_CANDIDATE'
+           ELSE 'REVIEW'
+       END AS tier
+FROM agentlens.dim_agent a
+LEFT JOIN clusters c ON c.config_hash = a.config_hash
+LEFT JOIN audit_usage u ON u.agent_key = a.agent_key
+LEFT JOIN trace_usage t ON t.agent_key = a.agent_key
+LEFT JOIN alloc al ON al.agent_key = a.agent_key
+WHERE a.native_agent_id <> '(unattributed)';
+
+CREATE OR REPLACE VIEW agentlens.v_cio_dup_clusters AS
+SELECT s.config_hash,
+       count(*) AS members,
+       string_agg(DISTINCT s.agent_type, ', ') AS agent_types,
+       min(s.agent_name) AS sample_name,
+       count(*) FILTER (WHERE s.has_usage_signal) AS used_members,
+       sum(s.audit_events) AS total_audit_events,
+       sum(s.total_tokens) AS total_tokens,
+       sum(s.allocated_cost_eur) AS allocated_cost_eur,
+       left(max(a.instructions), 300) AS prompt_sample
+FROM agentlens.v_cio_agent_scorecard s
+JOIN agentlens.dim_agent a ON a.agent_key = s.agent_key
+WHERE s.in_dup_cluster
+GROUP BY s.config_hash;
