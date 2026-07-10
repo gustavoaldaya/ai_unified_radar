@@ -28,6 +28,12 @@ Al arrancar se reconcilia con el servidor (adopta queries
 agentlens-backfill-* existentes por displayName). No toca el watermark
 del extractor incremental.
 
+Throttling de creacion (observado 2026-07-10): el servicio limita el ritmo
+de creacion de queries con 429 SIN Retry-After y sin limite documentado.
+Estrategia: un solo POST por intento y cooldown adaptativo entre intentos
+(2 min -> x2 -> tope 30 min, reset al primer exito). Polling y descargas
+no se ven afectados.
+
 Uso (desde agentlens/):
     uv run python .\\star\\backfill_audit_graph.py                     # 180 dias
     uv run python .\\star\\backfill_audit_graph.py --from 2026-05-01 --to 2026-07-10
@@ -208,15 +214,16 @@ def _create_query(ext, token: str, base: str, service: str,
         "filterEndDateTime": f"{(end + timedelta(days=1)).isoformat()}T00:00:00Z",
         "serviceFilter": service,
     }
-    status, body = _graph(ext._post_json, base, token, payload)
+    # Un solo POST por intento: este 429 llega sin Retry-After y reintentar
+    # en caliente renueva la penalizacion; el ritmo lo pone el cooldown
+    # adaptativo del bucle principal.
+    status, body, _retry = ext._post_json(base, token, payload)
     if status in (200, 201):
         return str(body["id"])
     detail = json.dumps(body)[:400]
     if status == 429:
-        # throttling agotado: no tirar el run; el chunk queda sin crear y el
-        # siguiente barrido lo reintenta (state.get(key) sigue siendo None).
-        print(f"[backfill-audit] 429 persistente creando {service}|{start}; "
-              "se reintenta en el proximo barrido", file=sys.stderr)
+        print(f"[backfill-audit] 429 creando {service}|{start}: {detail}",
+              file=sys.stderr)
         return None
     if status in (401, 403):
         raise SystemExit(
@@ -330,6 +337,8 @@ def main() -> int:
     deadline = time.monotonic() + args.max_wait_minutes * 60.0
     total_events = 0
     failed: list[str] = []
+    create_backoff = 120.0   # cooldown adaptativo de creacion (429 sin Retry-After)
+    next_create_at = 0.0
     while True:
         token = ext._aad_token(GRAPH_SCOPE)
         active = sum(
@@ -337,20 +346,31 @@ def main() -> int:
             if (entry := state.get(f"{_svc}|{cs.isoformat()}")) is not None
             and entry.get("id") and entry.get("status") not in TERMINAL
         )
-        # crear queries que falten: como mucho UNA por barrido (el servicio
-        # limita el ritmo de creacion; los jobs ya creados corren en paralelo)
-        for svc, cs, ce in keys:
-            key = f"{svc}|{cs.isoformat()}"
-            if state.get(key) is not None or active >= MAX_ACTIVE_QUERIES:
-                continue
-            qid = _create_query(ext, token, base, svc, cs, ce)
-            if qid is None:
-                break  # 429 agotado: no insistir con mas creaciones este barrido
-            state.put(key, {"id": qid, "status": "notStarted", "done": False,
-                            "range": [cs.isoformat(), ce.isoformat()]})
-            active += 1
-            print(f"[backfill-audit] creada {key} -> {qid}", file=sys.stderr)
-            break  # una creacion por barrido
+        # crear como mucho UNA query por barrido, solo si no estamos en
+        # cooldown: el servicio limita el ritmo de creacion y no anuncia la
+        # ventana, asi que el espaciado se adapta (2 min -> x2 -> tope 30 min,
+        # reset al primer exito). Polling y descargas no se ven afectados.
+        if time.monotonic() >= next_create_at:
+            for svc, cs, ce in keys:
+                key = f"{svc}|{cs.isoformat()}"
+                if state.get(key) is not None or active >= MAX_ACTIVE_QUERIES:
+                    continue
+                qid = _create_query(ext, token, base, svc, cs, ce)
+                if qid is None:
+                    print(f"[backfill-audit] cooldown de creacion "
+                          f"{create_backoff / 60:.1f} min", file=sys.stderr)
+                    next_create_at = time.monotonic() + create_backoff
+                    create_backoff = min(create_backoff * 2.0, 1800.0)
+                else:
+                    state.put(key, {"id": qid, "status": "notStarted",
+                                    "done": False,
+                                    "range": [cs.isoformat(), ce.isoformat()]})
+                    active += 1
+                    print(f"[backfill-audit] creada {key} -> {qid}",
+                          file=sys.stderr)
+                    create_backoff = 120.0
+                    next_create_at = time.monotonic() + 60.0
+                break  # un intento de creacion por barrido
 
         pending = [(svc, cs) for svc, cs, _ce in keys
                    if (e := state.get(f"{svc}|{cs.isoformat()}")) is None
