@@ -31,13 +31,12 @@ cubre TODO el estado, no solo la rejilla del run actual: cambiar de
 anteriores se drenan igualmente). No toca el watermark del extractor
 incremental.
 
-Throttling de creacion (observado 2026-07-10): el servicio limita el ritmo
-de creacion de queries con 429 SIN Retry-After y sin limite documentado
-(cuerpo: TooManyRequests generico a nivel tenant); la evidencia empirica
-apunta a creacion serializada/cuoteada muy baja. Estrategia: un solo POST
-por intento, cooldown adaptativo (2 min -> x2 -> tope 30 min, reset al
-primer exito) y REJILLAS GRANDES (pocos jobs): con creacion serializada,
-menos chunks = menos horas.
+Throttling de creacion (observado 2026-07-10/11): el tenant admite UNA
+sola query de backfill activa al mismo tiempo. El 429 (TooManyRequests
+generico, sin Retry-After) persiste mientras ese job siga running.
+Estrategia: esperar a que el job activo termine, descargarlo, y solo
+entonces crear el siguiente. El poll es tolerante a 5xx transitorios
+(devuelve None y reintenta en el proximo barrido sin abortar el run).
 
 Uso (desde agentlens/):
     uv run python .\\star\\backfill_audit_graph.py                     # 180 dias
@@ -63,11 +62,6 @@ sys.path.insert(0, _ROOT)
 
 
 def _load_env(root: str) -> None:
-    """Carga agentlens/.env en os.environ (sin pisar lo ya definido).
-
-    config.py delega la carga del .env en "el runner"; este script es su
-    propio runner. Sin dependencia de python-dotenv a proposito.
-    """
     path = os.path.join(root, ".env")
     if not os.path.exists(path):
         return
@@ -93,7 +87,7 @@ GRAPH_BASES = (
 )
 STATE_PATH = "_watermarks/ext-purview-audit-backfill.json"
 TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
-MAX_ACTIVE_QUERIES = 8  # el servicio limita las busquedas concurrentes
+MAX_ACTIVE_QUERIES = 8
 
 
 def _chunks(d_from: date, d_to: date, days: int) -> list[tuple[date, date]]:
@@ -107,8 +101,6 @@ def _chunks(d_from: date, d_to: date, days: int) -> list[tuple[date, date]]:
 
 
 class _State:
-    """Estado resumible del backfill, persistido via el StorageBackend."""
-
     def __init__(self, backend) -> None:
         self._backend = backend
         raw = backend.read_text(STATE_PATH)
@@ -125,7 +117,6 @@ class _State:
 
 
 def _graph(call, *args, attempts: int = 5):
-    """Ejecuta una llamada Graph con backoff en 429/5xx."""
     for attempt in range(1, attempts + 1):
         status, body, retry_after = call(*args)
         if status == 429 or status >= 500:
@@ -135,19 +126,10 @@ def _graph(call, *args, attempts: int = 5):
             time.sleep(wait)
             continue
         return status, body
-    return status, body  # ultimo intento, que decida el llamador
+    return status, body
 
 
 def _resolve_base(ext, token: str) -> str:
-    """Elige v1.0 o beta sondeando el listado de queries (GET) antes de crear.
-
-    Observado 2026-07-10: POST /v1.0/security/auditLog/queries devuelve 404
-    UnknownError en tenants donde beta funciona -- Learn aun referencia la
-    Audit Search Graph API en beta y el rollout de v1.0 va por detras.
-    Ademas, tras conceder AuditLogsQuery.Read.All el backend de audit puede
-    tardar ~15-30 min en reconocer al service principal (403/404
-    transitorios con el mismo aspecto).
-    """
     last: tuple | None = None
     for base in GRAPH_BASES:
         status, body = _graph(ext._get_json, f"{base}?$top=1", token)
@@ -166,14 +148,6 @@ def _resolve_base(ext, token: str) -> str:
 
 def _adopt_existing(ext, token: str, base: str, state: _State,
                     services: list[str]) -> None:
-    """Reconcilia con el servidor antes de crear nada.
-
-    Adopta al estado las queries ``agentlens-backfill-*`` que ya existan
-    (runs anteriores o cancelados) para no recrearlas -- los jobs siguen
-    corriendo en el servidor aunque el cliente muera -- e imprime el
-    inventario de jobs: la cuota de busquedas concurrentes por principal
-    es la causa tipica de 429 persistentes en la creacion.
-    """
     canonical = {s.lower(): s for s in services}
     url: str | None = f"{base}?$top=100"
     adopted = total = non_terminal = 0
@@ -215,13 +189,9 @@ def _create_query(ext, token: str, base: str, service: str,
         "@odata.type": "#microsoft.graph.security.auditLogQuery",
         "displayName": f"agentlens-backfill-{service.lower()}-{start.isoformat()}",
         "filterStartDateTime": f"{start.isoformat()}T00:00:00Z",
-        # fin exclusivo: medianoche del dia siguiente al ultimo dia del chunk
         "filterEndDateTime": f"{(end + timedelta(days=1)).isoformat()}T00:00:00Z",
         "serviceFilter": service,
     }
-    # Un solo POST por intento: este 429 llega sin Retry-After y reintentar
-    # en caliente renueva la penalizacion; el ritmo lo pone el cooldown
-    # adaptativo del bucle principal.
     status, body, _retry = ext._post_json(base, token, payload)
     if status in (200, 201):
         return str(body["id"])
@@ -239,20 +209,17 @@ def _create_query(ext, token: str, base: str, service: str,
     raise RuntimeError(f"crear query fallo: HTTP {status}: {detail}")
 
 
-def _poll_status(ext, token: str, base: str, query_id: str) -> str:
+def _poll_status(ext, token: str, base: str, query_id: str) -> str | None:
+    """Sondea el estado. Devuelve None en 5xx (reintentable sin abortar el run)."""
     status, body = _graph(ext._get_json, f"{base}/{query_id}", token)
-    if status != 200:
-        raise RuntimeError(f"poll de {query_id} fallo: HTTP {status}")
-    return str(body.get("status") or "unknown")
+    if status == 200:
+        return str(body.get("status") or "unknown")
+    print(f"[backfill-audit] WARN poll de {query_id} -> HTTP {status}; "
+          "se reintenta en el proximo barrido", file=sys.stderr)
+    return None
 
 
 def _download(ext, token: str, base: str, query_id: str) -> list[dict]:
-    """Pagina los records del job y los mapea con el _to_record del extractor.
-
-    Graph envuelve el evento original (PascalCase, mismo shape que los blobs
-    de la Management Activity API) en ``auditData``; el sobre aporta
-    fallbacks (id, createdDateTime, service, userPrincipalName).
-    """
     mapped: list[dict] = []
     url: str | None = f"{base}/{query_id}/records?$top=999"
     page = 0
@@ -283,9 +250,6 @@ def _download(ext, token: str, base: str, query_id: str) -> list[dict]:
 
 def _write_chunk(ext, raw_records: list[dict], service: str,
                  chunk_start: str) -> tuple[int, list[str]]:
-    """Valida/dedup con la maquinaria del extractor y escribe parquet por
-    FECHA DE EVENTO. Nombre de fichero estable por (dia, servicio, chunk):
-    re-ejecutar un chunk sobreescribe sus propios ficheros (idempotente)."""
     valid, invalid = ext.validate(raw_records)
     if invalid:
         ext.quarantine.write(invalid, datetime.now(timezone.utc).date())
@@ -342,7 +306,7 @@ def main() -> int:
     deadline = time.monotonic() + args.max_wait_minutes * 60.0
     total_events = 0
     failed: list[str] = []
-    create_backoff = 120.0   # cooldown adaptativo de creacion (429 sin Retry-After)
+    create_backoff = 120.0
     next_create_at = 0.0
     while True:
         token = ext._aad_token(GRAPH_SCOPE)
@@ -351,14 +315,13 @@ def main() -> int:
             if (entry := state.get(f"{_svc}|{cs.isoformat()}")) is not None
             and entry.get("id") and entry.get("status") not in TERMINAL
         )
-        # crear como mucho UNA query por barrido, solo si no estamos en
-        # cooldown: el servicio limita el ritmo de creacion y no anuncia la
-        # ventana, asi que el espaciado se adapta (2 min -> x2 -> tope 30 min,
-        # reset al primer exito). Polling y descargas no se ven afectados.
-        if time.monotonic() >= next_create_at:
+        # Serializado: solo intentar crear cuando active==0.
+        # El tenant admite 1 query de backfill activa; el 429 persiste
+        # mientras el job anterior siga running.
+        if time.monotonic() >= next_create_at and active == 0:
             for svc, cs, ce in keys:
                 key = f"{svc}|{cs.isoformat()}"
-                if state.get(key) is not None or active >= MAX_ACTIVE_QUERIES:
+                if state.get(key) is not None:
                     continue
                 qid = _create_query(ext, token, base, svc, cs, ce)
                 if qid is None:
@@ -375,12 +338,10 @@ def main() -> int:
                           file=sys.stderr)
                     create_backoff = 120.0
                     next_create_at = time.monotonic() + 60.0
-                break  # un intento de creacion por barrido
+                break
 
         missing = [1 for svc, cs, _ce in keys
                    if state.get(f"{svc}|{cs.isoformat()}") is None]
-        # el polling/descarga cubre TODO el estado (incluidas entradas de
-        # rejillas anteriores o adoptadas): las rejillas son componibles
         pending = [k for k, e in state.data["queries"].items()
                    if not e.get("done")]
         if not missing and not pending:
@@ -390,6 +351,8 @@ def main() -> int:
             svc, _, day = key.partition("|")
             entry = state.get(key)
             status = _poll_status(ext, token, base, entry["id"])
+            if status is None:
+                continue
             if status != entry.get("status"):
                 entry = {**entry, "status": status}
                 state.put(key, entry)
