@@ -31,17 +31,21 @@ cubre TODO el estado, no solo la rejilla del run actual: cambiar de
 anteriores se drenan igualmente). No toca el watermark del extractor
 incremental.
 
-Throttling de creacion (observado 2026-07-10/11): el tenant admite UNA
-sola query de backfill activa al mismo tiempo. El 429 (TooManyRequests
-generico, sin Retry-After) persiste mientras ese job siga running.
-Estrategia: esperar a que el job activo termine, descargarlo, y solo
-entonces crear el siguiente. El poll es tolerante a 5xx transitorios
-(devuelve None y reintenta en el proximo barrido sin abortar el run).
+Throttling y resiliencia (observado 2026-07-10/11):
+  * El tenant admite 1 sola query de backfill activa simultaneamente.
+    El 429 persiste mientras el job anterior siga running. Solo se
+    intenta crear cuando active==0.
+  * El poll y la descarga son tolerantes a 5xx transitorios (504/502):
+    devuelven None/url-parcial y retoman en el siguiente barrido sin
+    abortar el run.
+  * La descarga es reanudable: si se interrumpe a mitad de paginacion,
+    persiste el nextLink y los eventos acumulados en el state y los
+    une con la siguiente descarga parcial hasta completar.
 
 Uso (desde agentlens/):
     uv run python .\\star\\backfill_audit_graph.py                     # 180 dias
     uv run python .\\star\\backfill_audit_graph.py --from 2026-01-26 --chunk-days 45
-    uv run python .\\star\\backfill_audit_graph.py --chunk-days 10 --poll-interval 30
+    uv run python .\\star\\backfill_audit_graph.py --poll-interval 180  # red inestable
 Despues de terminar:
     uv run python .\\star\\build_star_pg.py       # carga los parquets nuevos
 """
@@ -210,8 +214,12 @@ def _create_query(ext, token: str, base: str, service: str,
 
 
 def _poll_status(ext, token: str, base: str, query_id: str) -> str | None:
-    """Sondea el estado. Devuelve None en 5xx (reintentable sin abortar el run)."""
-    status, body = _graph(ext._get_json, f"{base}/{query_id}", token)
+    """Sondea el estado. Devuelve None en 5xx (reintentable sin abortar el run).
+
+    Solo 2 reintentos: el estado de un job de audit cambia en minutos, no
+    segundos; acumular 5 reintentos de 75s bloquea el barrido innecesariamente.
+    """
+    status, body = _graph(ext._get_json, f"{base}/{query_id}", token, attempts=2)
     if status == 200:
         return str(body.get("status") or "unknown")
     print(f"[backfill-audit] WARN poll de {query_id} -> HTTP {status}; "
@@ -219,14 +227,24 @@ def _poll_status(ext, token: str, base: str, query_id: str) -> str | None:
     return None
 
 
-def _download(ext, token: str, base: str, query_id: str) -> list[dict]:
+def _download(ext, token: str, base: str, query_id: str,
+              resume_url: str | None = None) -> tuple[list[dict], str | None]:
+    """Pagina los records del job. Reanudable: devuelve (mapped, next_url).
+
+    Si next_url es None al retornar, la descarga esta completa.
+    Si es un string, hubo un 5xx en esa pagina; el llamador debe persistir
+    next_url en el state y reanudar en el siguiente barrido.
+    """
     mapped: list[dict] = []
-    url: str | None = f"{base}/{query_id}/records?$top=999"
+    url: str | None = resume_url or f"{base}/{query_id}/records?$top=999"
     page = 0
     while url:
-        status, body = _graph(ext._get_json, url, token)
+        status, body = _graph(ext._get_json, url, token, attempts=3)
         if status != 200:
-            raise RuntimeError(f"descarga de {query_id} fallo: HTTP {status}")
+            print(f"[backfill-audit] WARN descarga de {query_id} -> HTTP {status} "
+                  f"en pagina {page}; se reanuda en el proximo barrido",
+                  file=sys.stderr)
+            return mapped, url  # next_url != None => descarga incompleta
         page += 1
         for rec in body.get("value") or []:
             data = rec.get("auditData")
@@ -245,7 +263,7 @@ def _download(ext, token: str, base: str, query_id: str) -> list[dict]:
             print(f"[backfill-audit]   ... {page} paginas, "
                   f"{len(mapped)} eventos relevantes", file=sys.stderr)
         url = body.get("@odata.nextLink")
-    return mapped
+    return mapped, None  # descarga completa
 
 
 def _write_chunk(ext, raw_records: list[dict], service: str,
@@ -315,9 +333,6 @@ def main() -> int:
             if (entry := state.get(f"{_svc}|{cs.isoformat()}")) is not None
             and entry.get("id") and entry.get("status") not in TERMINAL
         )
-        # Serializado: solo intentar crear cuando active==0.
-        # El tenant admite 1 query de backfill activa; el 429 persiste
-        # mientras el job anterior siga running.
         if time.monotonic() >= next_create_at and active == 0:
             for svc, cs, ce in keys:
                 key = f"{svc}|{cs.isoformat()}"
@@ -358,13 +373,25 @@ def main() -> int:
                 state.put(key, entry)
                 print(f"[backfill-audit] {key}: {status}", file=sys.stderr)
             if status == "succeeded":
-                records = _download(ext, token, base, entry["id"])
-                count, files = _write_chunk(ext, records, svc, day)
-                total_events += count
-                state.put(key, {**entry, "done": True, "records": count,
-                                "files": files})
-                print(f"[backfill-audit] {key}: {count} eventos relevantes -> "
-                      f"{len(files)} parquets", file=sys.stderr)
+                resume_url = entry.get("resume_url") or None
+                prev_records = entry.get("partial_records") or []
+                records, next_url = _download(ext, token, base, entry["id"],
+                                              resume_url=resume_url)
+                all_records = prev_records + records
+                if next_url is not None:
+                    # descarga incompleta: persistir progreso y reanudar en siguiente barrido
+                    state.put(key, {**entry, "resume_url": next_url,
+                                    "partial_records": all_records})
+                    print(f"[backfill-audit] {key}: descarga pausada "
+                          f"({len(all_records)} eventos hasta ahora)", file=sys.stderr)
+                else:
+                    count, files = _write_chunk(ext, all_records, svc, day)
+                    total_events += count
+                    state.put(key, {**entry, "done": True, "records": count,
+                                    "files": files, "resume_url": None,
+                                    "partial_records": None})
+                    print(f"[backfill-audit] {key}: {count} eventos relevantes -> "
+                          f"{len(files)} parquets", file=sys.stderr)
             elif status in ("failed", "cancelled"):
                 state.put(key, {**entry, "done": True, "error": True})
                 failed.append(key)
