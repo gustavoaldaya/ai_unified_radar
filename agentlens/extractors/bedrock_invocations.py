@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Iterator
 
@@ -32,9 +33,33 @@ class BedrockInvocationsExtractor(AwsClientSource, BaseExtractor):
                 kwargs["nextToken"] = token
             self.rate_limit().before_request()
             resp = client.filter_log_events(**kwargs)
-            yield [
-                {"request_id": e.get("eventId"), **e} for e in resp.get("events", [])
-            ]
+            yield [self._map_event(e) for e in resp.get("events", [])]
             token = resp.get("nextToken")
             if not token:
                 break
+
+    @staticmethod
+    def _map_event(event: dict) -> dict:
+        """Sobre de CloudWatch -> registro plano ModelInvocationLog (seam live).
+
+        El evento de filter_log_events trae el ModelInvocationLog como string
+        JSON en ``message``; el schema espera los campos ya aplanados (la forma
+        de las fixtures). Con entrega de solo metadatos, input/output llegan
+        sin payload pero con los token counts.
+        """
+        try:
+            rec = json.loads(event.get("message") or "{}")
+        except ValueError:
+            rec = {}
+        return {
+            "request_id": rec.get("requestId") or event.get("eventId"),
+            "timestamp": rec.get("timestamp"),
+            "schema_type": rec.get("schemaVersion"),
+            "account_id": rec.get("accountId"),
+            "identity_arn": (rec.get("identity") or {}).get("arn"),
+            "region": rec.get("region"),
+            "operation": rec.get("operation"),
+            "model_id": rec.get("modelId"),
+            "input_token_count": (rec.get("input") or {}).get("inputTokenCount"),
+            "output_token_count": (rec.get("output") or {}).get("outputTokenCount"),
+        }
