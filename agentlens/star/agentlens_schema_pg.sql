@@ -596,3 +596,327 @@ FROM agentlens.v_cio_agent_scorecard s
 JOIN agentlens.dim_agent a ON a.agent_key = s.agent_key
 WHERE s.in_dup_cluster
 GROUP BY s.config_hash;
+
+-- ============ ADR-011: COSTE POR MÉTODO Y DRIVERS ============
+-- Modelo de coste transparente por origen de agente (decisión ADR-011 del
+-- orquestador AgentLens). Sustituye la asunción implícita de que todo coste
+-- es "factura cloud prorrateada por tokens" (v_finops_cost_allocation, que
+-- NO se modifica) por un modelo explícito: cada agente tiene un método de
+-- coste según su cloud/tipo (cost_method_map), y cada método genérico se
+-- calcula a partir de un driver con una tarifa vigente (cost_driver_rate).
+--
+-- Métodos soportados:
+--   metered_allocated  -> coste de factura cloud (Azure/AWS) prorrateado por
+--                         share de tokens de trazas atribuidas. Ver Bloque A.
+--   credit_rated        -> coste de créditos Copilot (M365) rateado a EUR y
+--                         repartido por share de eventos de auditoría. Ver
+--                         Bloque B. Incluye entradas M365 "sin tipo".
+--   license_amortized   -> coste de licencia Copilot amortizado semanalmente
+--                         por nº de asientos con licencia. Ver Bloque C. No
+--                         se reparte por agente (coste a nivel de tenant).
+--   bundled_zero         -> coste ya incluido en la licencia M365 base
+--                         (SharePoint, Toolkit, apps Teams/"Not Available");
+--                         coste marginal cero, no emite filas en la vista
+--                         unificada (solo aparece etiquetado en
+--                         v_agent_cost_method).
+
+-- ---------- 1. Tabla de configuración: método de coste por origen ----------
+CREATE TABLE IF NOT EXISTS agentlens.cost_method_map (
+    map_id              INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    cloud               TEXT NOT NULL,
+    agent_type_pattern  TEXT NOT NULL,   -- patrón LIKE sobre dim_agent.agent_type;
+                                          -- '__NULL__' es el centinela para agent_type IS NULL
+    cost_method         TEXT NOT NULL,
+    cost_driver          TEXT NOT NULL,
+    priority             INTEGER NOT NULL DEFAULT 100,  -- menor gana
+    notes                TEXT,
+    UNIQUE (cloud, agent_type_pattern)
+);
+
+COMMENT ON TABLE agentlens.cost_method_map IS
+    'ADR-011: mapea cloud + patrón de agent_type al método de coste (cost_method) '
+    'y su driver (cost_driver). Consumida por v_agent_cost_method.';
+
+-- Semillas: descubiertas contra dim_agent real (2026-07-31):
+--   aws/gen_ai_agent(6), aws/NULL(1,centinela)
+--   azure/NULL(1,centinela)
+--   m365/AmazonBedrock(2), m365/Copilot Studio(508), m365/Databricks(6),
+--   m365/Foundry(39), m365/Microsoft 365 Agents Toolkit(1),
+--   m365/Microsoft 365 Copilot Agent Builder(1035), m365/Not Available(230),
+--   m365/SharePoint(79), m365/NULL(1,centinela)
+-- Cobertura: todo agent_type real casa con un patrón; se añade además un
+-- fallback m365/% de baja prioridad (200) para tipos futuros no previstos.
+INSERT INTO agentlens.cost_method_map
+    (cloud, agent_type_pattern, cost_method, cost_driver, priority, notes)
+VALUES
+    ('aws',   '%',                                       'metered_allocated', 'tokens',       100, 'Factura cloud prorrateada por share de tokens de trazas atribuidas'),
+    ('aws',   '__NULL__',                                'metered_allocated', 'tokens',        50, 'Centinela unattributed de aws: mismo método que el resto de aws (el método del cloud correspondiente)'),
+    ('azure', '%',                                       'metered_allocated', 'tokens',       100, 'Factura cloud prorrateada por share de tokens de trazas atribuidas'),
+    ('azure', '__NULL__',                                'metered_allocated', 'tokens',        50, 'Centinela unattributed de azure: mismo método que el resto de azure (el método del cloud correspondiente)'),
+    ('m365',  'SharePoint',                               'bundled_zero',      'none',          50, 'Coste empaquetado en licencia M365, marginal cero'),
+    ('m365',  'Microsoft 365 Agents Toolkit',              'bundled_zero',      'none',          50, 'Coste empaquetado en licencia M365, marginal cero'),
+    ('m365',  'Not Available',                             'bundled_zero',      'none',          50, 'Coste empaquetado en licencia M365, marginal cero (tipo de agente no resuelto, típico de apps Teams)'),
+    ('m365',  '%Teams%',                                    'bundled_zero',      'none',          50, 'Apps de Teams: coste empaquetado en licencia M365, marginal cero'),
+    ('m365',  'Copilot Studio',                             'credit_rated',      'audit_events',  50, 'Consumo de créditos Copilot rateado y repartido por eventos de auditoría'),
+    ('m365',  'Microsoft 365 Copilot Agent Builder',         'credit_rated',      'audit_events',  50, 'Consumo de créditos Copilot rateado y repartido por eventos de auditoría'),
+    ('m365',  '%Declarative%',                               'credit_rated',      'audit_events',  50, 'Agente declarativo: consumo de créditos Copilot rateado y repartido por eventos de auditoría'),
+    ('m365',  '__NULL__',                                    'credit_rated',      'audit_events',  50, 'Sin tipo resuelto (incluye centinela unattributed de m365): tratado como creditable audit-based'),
+    ('m365',  'Foundry',                                     'metered_allocated', 'tokens',        50, 'Entrada federada del registro A365: el runtime factura en su cloud'),
+    ('m365',  'Databricks',                                  'metered_allocated', 'tokens',        50, 'Entrada federada del registro A365: el runtime factura en su cloud'),
+    ('m365',  '%Bedrock%',                                    'metered_allocated', 'tokens',        50, 'Entrada federada del registro A365 (AmazonBedrock): el runtime factura en su cloud'),
+    ('m365',  '%',                                            'credit_rated',      'audit_events', 200, 'Fallback: tipo m365 no reconocido explícitamente, tratado como creditable audit-based')
+ON CONFLICT (cloud, agent_type_pattern) DO NOTHING;
+
+-- ---------- 2. Tabla de configuración: tarifas de los drivers ----------
+CREATE TABLE IF NOT EXISTS agentlens.cost_driver_rate (
+    rate_id       INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    scope          TEXT,
+    driver         TEXT,
+    unit_rate      NUMERIC,
+    currency       TEXT DEFAULT 'EUR',
+    rate_quality    TEXT DEFAULT 'estimated',
+    source          TEXT,
+    valid_from      DATE,
+    valid_to        DATE NULL,
+    UNIQUE (scope, driver, valid_from)
+);
+
+COMMENT ON TABLE agentlens.cost_driver_rate IS
+    'ADR-011: tarifas vigentes por (scope, driver) con vigencia temporal. '
+    'Consumida por v_finops_agent_cost_unified para los métodos credit_rated '
+    'y license_amortized.';
+
+INSERT INTO agentlens.cost_driver_rate
+    (scope, driver, unit_rate, currency, rate_quality, source, valid_from, valid_to)
+VALUES
+    ('m365', 'credit',              0.008684, 'EUR', 'estimated', 'PAYG $0.01/crédito × fx 0.868405 xe.com 31-jul-2026; pendiente confirmar política PAYG con Microsoft', '2026-01-01', NULL),
+    ('m365', 'credit_pack',         0.006947, 'EUR', 'estimated', 'Pack $200/25.000 créditos × fx; tarifa alternativa NO usada por la vista', '2026-01-01', NULL),
+    ('m365', 'copilot_seat_month', 26.05,     'EUR', 'estimated', '$30/usuario/mes Enterprise × fx 0.868405', '2026-01-01', NULL),
+    ('fx',   'usd_eur',             0.868405, 'EUR', 'estimated', 'xe.com mid-market 31-jul-2026', '2026-01-01', NULL)
+ON CONFLICT (scope, driver, valid_from) DO NOTHING;
+
+-- ---------- 3. Vista: método de coste resuelto por agente ----------
+-- Cada agente de dim_agent (incluidos los 3 centinelas unattributed) resuelve
+-- a exactamente un método, eligiendo el patrón de menor priority que casa
+-- con su cloud + agent_type (LATERAL + LIMIT 1). Cobertura obligatoria: 0
+-- agentes sin método (ver smoke test).
+CREATE OR REPLACE VIEW agentlens.v_agent_cost_method AS
+SELECT a.agent_key,
+       a.cloud,
+       a.agent_type,
+       m.cost_method,
+       m.cost_driver
+FROM agentlens.dim_agent a
+JOIN LATERAL (
+    SELECT cm.cost_method, cm.cost_driver
+    FROM agentlens.cost_method_map cm
+    WHERE cm.cloud = a.cloud
+      AND (
+            (a.agent_type IS NOT NULL AND a.agent_type LIKE cm.agent_type_pattern)
+         OR (a.agent_type IS NULL AND cm.agent_type_pattern = '__NULL__')
+          )
+    ORDER BY cm.priority ASC, cm.map_id ASC
+    LIMIT 1
+) m ON TRUE;
+
+COMMENT ON VIEW agentlens.v_agent_cost_method IS
+    'ADR-011: método y driver de coste resuelto para cada agente de dim_agent.';
+
+-- ---------- 4. Vista: coste FinOps unificado por método y driver ----------
+-- UNION ALL de tres bloques de cálculo genérico por driver. bundled_zero no
+-- emite filas (coste marginal cero, ya etiquetado en v_agent_cost_method).
+-- [Fix validación independiente 2026-07-31, ver puntos 1-3 abajo]
+CREATE OR REPLACE VIEW agentlens.v_finops_agent_cost_unified AS
+WITH
+-- Bloque A: metered_allocated, a partir de v_finops_cost_allocation (NO se
+-- modifica esa vista). Grano diario, agregado a (date_key, cloud, agent_key)
+-- sumando sobre model_key (el detalle por modelo sigue disponible en
+-- v_finops_cost_allocation). Incluye tanto filas asignadas a agente como el
+-- remanente 'unallocated' a nivel de cloud (agent_key NULL).
+block_a AS (
+    SELECT v.date_key,
+           v.cloud,
+           v.agent_key,
+           'metered_allocated'::text AS cost_method,
+           'tokens'::text            AS cost_driver,
+           sum(v.tokens)::numeric    AS driver_qty,
+           NULL::numeric             AS unit_rate,
+           sum(v.allocated_cost)     AS allocated_cost,
+           max(v.currency)           AS currency,
+           CASE WHEN v.cost_basis = 'allocated' THEN 'billed_allocated'
+                ELSE 'billed_unallocated' END AS cost_quality,
+           'day'::text AS period_grain
+    FROM agentlens.v_finops_cost_allocation v
+    GROUP BY v.date_key, v.cloud, v.agent_key, v.cost_basis
+),
+-- Bloque B: credit_rated, grano semanal. Semanas = fact_copilot_credits.date_key
+-- (inicio de semana). El pool semanal de créditos se PARTE por
+-- is_copilot_licensed (los créditos y las licencias no son aditivos: parte
+-- del consumo de créditos ya está cubierto por el asiento Copilot):
+--   - créditos de personas NO licenciadas (PAYG, facturable, aditivo):
+--     se reparten por share de eventos de fact_agent_audit dentro de
+--     [semana, semana+6] entre agentes ELEGIBLES (cost_method='credit_rated'
+--     en v_agent_cost_method, excluyendo el centinela unattributed). Los
+--     eventos de agentes NO elegibles (bundled_zero, metered_allocated
+--     federado) y del centinela siguen contando en el denominador (total de
+--     eventos de la semana) pero no en el numerador: su share "engorda" la
+--     fila 'rated_payg_unallocated', no desaparece. cost_quality:
+--     'rated_payg_allocated' / 'rated_payg_unallocated'.
+--   - créditos de personas licenciadas: coste sombra ya cubierto por la
+--     licencia (NO aditivo, memo), UNA fila semanal agent_key NULL,
+--     cost_quality='rated_included', cost_driver='credits'.
+weeks_rated AS (
+    SELECT c.date_key                                                                        AS week_date_key,
+           to_date(c.date_key::text, 'YYYYMMDD')                                              AS week_start,
+           COALESCE(sum(c.total_credits_used) FILTER (WHERE NOT COALESCE(c.is_copilot_licensed, false)), 0) AS week_credits_payg,
+           COALESCE(sum(c.total_credits_used) FILTER (WHERE c.is_copilot_licensed), 0)        AS week_credits_included,
+           r.unit_rate                                                                        AS credit_rate
+    FROM agentlens.fact_copilot_credits c
+    JOIN agentlens.cost_driver_rate r
+      ON r.scope = 'm365' AND r.driver = 'credit'
+     AND r.valid_from <= to_date(c.date_key::text, 'YYYYMMDD')
+     AND to_date(c.date_key::text, 'YYYYMMDD') < COALESCE(r.valid_to, 'infinity'::date)
+    GROUP BY c.date_key, r.unit_rate
+),
+audit_events AS (
+    SELECT to_date(fa.date_key::text, 'YYYYMMDD') AS event_date,
+           fa.agent_key
+    FROM agentlens.fact_agent_audit fa
+    WHERE fa.agent_key IS NOT NULL
+),
+week_events AS (
+    -- total de eventos de la semana, incluye centinela y agentes no
+    -- elegibles (para que su share "engorde" el pool unallocated)
+    SELECT w.week_date_key,
+           count(ae.agent_key) AS total_events
+    FROM weeks_rated w
+    LEFT JOIN audit_events ae
+      ON ae.event_date BETWEEN w.week_start AND w.week_start + 6
+    GROUP BY w.week_date_key
+),
+agent_week_events AS (
+    -- eventos por agente ELEGIBLE (cost_method='credit_rated' y NO
+    -- centinela) dentro de la semana
+    SELECT w.week_date_key,
+           ae.agent_key,
+           count(*) AS agent_events
+    FROM weeks_rated w
+    JOIN audit_events ae
+      ON ae.event_date BETWEEN w.week_start AND w.week_start + 6
+    JOIN agentlens.v_agent_cost_method m
+      ON m.agent_key = ae.agent_key AND m.cost_method = 'credit_rated'
+    WHERE ae.agent_key NOT IN (
+        SELECT agent_key FROM agentlens.dim_agent WHERE native_agent_id = '(unattributed)'
+    )
+    GROUP BY w.week_date_key, ae.agent_key
+),
+agent_alloc AS (
+    SELECT w.week_date_key,
+           aw.agent_key,
+           aw.agent_events,
+           w.credit_rate,
+           round((w.week_credits_payg * w.credit_rate * aw.agent_events::numeric / NULLIF(we.total_events, 0))::numeric, 6) AS agent_cost
+    FROM weeks_rated w
+    JOIN week_events we ON we.week_date_key = w.week_date_key
+    JOIN agent_week_events aw ON aw.week_date_key = w.week_date_key
+    WHERE we.total_events > 0
+),
+week_summary AS (
+    SELECT w.week_date_key,
+           w.week_credits_payg,
+           w.credit_rate,
+           (w.week_credits_payg * w.credit_rate) AS week_cost_payg,
+           COALESCE(sum(aa.agent_cost), 0)       AS assigned_cost
+    FROM weeks_rated w
+    LEFT JOIN agent_alloc aa ON aa.week_date_key = w.week_date_key
+    GROUP BY w.week_date_key, w.week_credits_payg, w.credit_rate
+),
+block_b_allocated AS (
+    SELECT week_date_key AS date_key,
+           'm365'::text  AS cloud,
+           agent_key,
+           'credit_rated'::text AS cost_method,
+           'audit_events'::text AS cost_driver,
+           agent_events::numeric AS driver_qty,
+           credit_rate AS unit_rate,
+           agent_cost AS allocated_cost,
+           'EUR'::text AS currency,
+           'rated_payg_allocated'::text AS cost_quality,
+           'week'::text AS period_grain
+    FROM agent_alloc
+),
+block_b_unallocated AS (
+    -- resto del pool PAYG: share de eventos del centinela + agentes no
+    -- elegibles (bundled_zero, metered_allocated federado) + semanas sin
+    -- eventos. driver_qty = créditos PAYG sin asignar (equivalente
+    -- algebraico de (week_cost_payg - assigned_cost) / credit_rate, exacto
+    -- incluso sin eventos).
+    SELECT week_date_key AS date_key,
+           'm365'::text  AS cloud,
+           NULL::integer AS agent_key,
+           'credit_rated'::text AS cost_method,
+           'audit_events'::text AS cost_driver,
+           (week_credits_payg - (assigned_cost / credit_rate)) AS driver_qty,
+           credit_rate AS unit_rate,
+           (week_cost_payg - assigned_cost) AS allocated_cost,
+           'EUR'::text AS currency,
+           'rated_payg_unallocated'::text AS cost_quality,
+           'week'::text AS period_grain
+    FROM week_summary
+),
+block_b_included AS (
+    -- pool cubierto por licencia (memo, NO aditivo): una fila por semana,
+    -- sin repartir por agente ni por eventos.
+    SELECT week_date_key AS date_key,
+           'm365'::text  AS cloud,
+           NULL::integer AS agent_key,
+           'credit_rated'::text AS cost_method,
+           'credits'::text AS cost_driver,
+           week_credits_included AS driver_qty,
+           credit_rate AS unit_rate,
+           (week_credits_included * credit_rate) AS allocated_cost,
+           'EUR'::text AS currency,
+           'rated_included'::text AS cost_quality,
+           'week'::text AS period_grain
+    FROM weeks_rated
+),
+-- Bloque C: license_amortized, grano semanal, coste a nivel de tenant (no se
+-- reparte por agente). seats = personas con licencia Copilot activa esa
+-- semana; coste = seats × tarifa copilot_seat_month semanalizada (12/52.18).
+block_c AS (
+    SELECT c.date_key AS date_key,
+           'm365'::text AS cloud,
+           NULL::integer AS agent_key,
+           'license_amortized'::text AS cost_method,
+           'seats'::text AS cost_driver,
+           count(DISTINCT c.person_id) FILTER (WHERE c.is_copilot_licensed)::numeric AS driver_qty,
+           r.unit_rate AS unit_rate,
+           round((count(DISTINCT c.person_id) FILTER (WHERE c.is_copilot_licensed)::numeric * r.unit_rate * 12.0 / 52.18)::numeric, 6) AS allocated_cost,
+           'EUR'::text AS currency,
+           'estimated'::text AS cost_quality,
+           'week'::text AS period_grain
+    FROM agentlens.fact_copilot_credits c
+    JOIN agentlens.cost_driver_rate r
+      ON r.scope = 'm365' AND r.driver = 'copilot_seat_month'
+     AND r.valid_from <= to_date(c.date_key::text, 'YYYYMMDD')
+     AND to_date(c.date_key::text, 'YYYYMMDD') < COALESCE(r.valid_to, 'infinity'::date)
+    GROUP BY c.date_key, r.unit_rate
+)
+SELECT * FROM block_a
+UNION ALL
+SELECT * FROM block_b_allocated
+UNION ALL
+SELECT * FROM block_b_unallocated
+UNION ALL
+SELECT * FROM block_b_included
+UNION ALL
+SELECT * FROM block_c;
+
+COMMENT ON VIEW agentlens.v_finops_agent_cost_unified IS
+    'ADR-011: coste FinOps unificado por método/driver (metered_allocated diario '
+    'desde v_finops_cost_allocation agregado por model_key, credit_rated '
+    '(PAYG repartido por eventos entre agentes elegibles + memo included por '
+    'licencia) y license_amortized semanales desde fact_copilot_credits/'
+    'fact_agent_audit). bundled_zero no emite filas. '
+    'total aditivo = billed_* + rated_payg* + license_amortized; '
+    'rated_included es memo no aditivo.';
