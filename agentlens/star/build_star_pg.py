@@ -49,12 +49,44 @@ UNATTRIBUTED = "(unattributed)"
 NULL_OWNER_GUID = "00000000-0000-0000-0000-000000000000"
 UNKNOWN_MODEL = "(unknown)"
 
+# Regla de mapeo: model native_id -> cloud real (independiente del plano de ingesta).
+# Algunos parquets de Foundry/Azure incluyen modelos de otros clouds;
+# se normaliza aquí para que dim_model.cloud refleje el runtime de facturación.
+_MODEL_CLOUD_OVERRIDES: dict[str, str] = {
+    # Amazon Nova servido vía Azure AI Foundry -> sigue siendo un modelo AWS
+    "eu.amazon.nova-2-lite-v1:0": "aws",
+    "us.amazon.nova-2-lite-v1:0": "aws",
+    "amazon.nova-lite-v1:0":       "aws",
+    "amazon.nova-pro-v1:0":        "aws",
+    "amazon.nova-micro-v1:0":      "aws",
+    # Titan embeddings
+    "amazon.titan-embed-text-v2:0": "aws",
+    "amazon.titan-embed-text-v1":   "aws",
+}
+
+
+def _resolve_model_cloud(cloud: str, native_id: str) -> str:
+    """Devuelve el cloud real del modelo, corrigiendo discrepancias de plano de ingesta.
+
+    Si el native_id tiene un prefijo canonicamente de otro cloud
+    (p. ej. 'eu.amazon.' en un parquet de Azure), se aplica el override.
+    Si el native_id empieza por 'arn:aws:' o 'amazon.' el cloud es siempre 'aws'.
+    En cualquier otro caso se respeta el cloud del plano de ingesta.
+    """
+    if native_id in _MODEL_CLOUD_OVERRIDES:
+        return _MODEL_CLOUD_OVERRIDES[native_id]
+    lc = native_id.lower()
+    if lc.startswith(("arn:aws:", "amazon.", "eu.amazon.", "us.amazon.")):
+        return "aws"
+    return cloud
+
 _SCHEMA_SQL_PATH = os.path.join(os.path.dirname(__file__), "agentlens_schema_pg.sql")
 
 # traces -> agent-attributed consumption. Each span emits one row per measure.
 TRACE_SOURCES = [
     {
         "glob": "foundry/traces/dt=*/*.parquet",
+        "layout": "foundry",
         "cloud": "azure",
         "id_namespace": "foundry_otel",
         "agent_id": ("gen_ai_agent_id",),
@@ -64,6 +96,7 @@ TRACE_SOURCES = [
     },
     {
         "glob": "bedrock/traces/dt=*/*.parquet",
+        "layout": "bedrock",
         "cloud": "aws",
         "id_namespace": "bedrock_arn",
         "agent_id": ("gen_ai_agent_id", "agent_endpoint_id"),
@@ -143,6 +176,39 @@ def _json_or_none(value: Any) -> str | None:
     if isinstance(value, (list, dict)):
         return json.dumps(value, ensure_ascii=False) if value else None
     return str(value)
+
+
+def _drift_dict(value: Any) -> dict:
+    """Parse the ``_drift`` JSON column of a parquet row into a dict (or {})."""
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(value)
+    except (ValueError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_tool(value: Any) -> str | None:
+    """First element of a ``tool_invocations`` list (a JSON string in parquet)."""
+    if not value:
+        return None
+    try:
+        arr = json.loads(value) if isinstance(value, str) else value
+    except (ValueError, TypeError):
+        return None
+    return _text(arr[0]) if isinstance(arr, list) and arr else None
 
 
 def _dotnet_date(value: Any) -> str | None:
@@ -410,9 +476,10 @@ class StarBuilder:
         )
 
     def model_key(self, cloud: str, native_id: str) -> int:
+        resolved_cloud = _resolve_model_cloud(cloud, native_id)
         return self._simple_dim_key(
-            "dim_model", self._models, (cloud, native_id),
-            ("cloud", "native_id"), (cloud, native_id),
+            "dim_model", self._models, (resolved_cloud, native_id),
+            ("cloud", "native_id"), (resolved_cloud, native_id),
             ("cloud", "native_id"), "model_key",
         )
 
@@ -582,62 +649,146 @@ class StarBuilder:
         return self.agent_key(cloud, UNATTRIBUTED, agent_name=None), "unattributed"
 
     def load_traces(self, raw_root: str) -> int:
+        """Dispatch por layout: foundry (columnas OTel de nivel superior) o
+        bedrock (RawBedrockTrace de ext-bedrock-traces, con name/kind/parent y
+        tokens desglosados en _drift, e identidad de agente creada desde la
+        traza). Cada glob se consume una sola vez (iter_rows lleva el watermark)."""
         facts = 0
         for source in TRACE_SOURCES:
-            cloud = source["cloud"]
-            namespace = source.get("id_namespace", "")
-            id_fields = source["agent_id"]
-            # Materialise once: iter_rows also drives the load-log watermark, so
-            # each glob must be consumed exactly once.
             rows = list(self.iter_rows(raw_root, source["glob"]))
-            # Pass 1: trace_id -> first agent id seen anywhere in that trace.
-            trace_agent: dict[str, str] = {}
-            for row in rows:
-                tid = _text(row.get("trace_id"))
-                aid = next((_text(row.get(f)) for f in id_fields if _text(row.get(f))), None)
-                if tid and aid and tid not in trace_agent:
-                    trace_agent[tid] = aid
-            # Pass 2: resolve tier, land span-grain, stage consumption.
-            for row in rows:
-                ts = _text(row.get("timestamp"))
-                if ts is None:
+            if source.get("layout") == "bedrock":
+                facts += self._load_bedrock_spans(source, rows)
+            else:
+                facts += self._load_foundry_spans(source, rows)
+        return facts
+
+    def _load_foundry_spans(self, source: dict, rows: list[dict]) -> int:
+        """Foundry OTel traces: campos en columnas de nivel superior; el agente
+        se resuelve por bridge/native/correlacion o cae al centinela."""
+        cloud = source["cloud"]
+        namespace = source.get("id_namespace", "")
+        id_fields = source["agent_id"]
+        facts = 0
+        # Pass 1: trace_id -> first agent id seen anywhere in that trace.
+        trace_agent: dict[str, str] = {}
+        for row in rows:
+            tid = _text(row.get("trace_id"))
+            aid = next((_text(row.get(f)) for f in id_fields if _text(row.get(f))), None)
+            if tid and aid and tid not in trace_agent:
+                trace_agent[tid] = aid
+        # Pass 2: resolve tier, land span-grain, stage consumption.
+        for row in rows:
+            ts = _text(row.get("timestamp"))
+            if ts is None:
+                continue
+            span_native = next(
+                (_text(row.get(f)) for f in id_fields if _text(row.get(f))), None
+            )
+            tid = _text(row.get("trace_id"))
+            trace_native = trace_agent.get(tid) if tid else None
+            agent_key, tier = self._resolve_agent(
+                cloud, namespace, span_native, trace_native
+            )
+            model_native = (
+                _text(row.get(source["model"])) if source["model"] else None
+            ) or UNKNOWN_MODEL
+            sid = _text(row.get("span_id"))
+            if tid and sid:
+                op = _text(row.get("span_kind"))
+                self._traces.append((
+                    tid, sid, _text(row.get("parent_span_id")),
+                    agent_key, self.model_key(cloud, model_native),
+                    self.date_key(ts), ts, op,
+                    self._SPAN_KIND.get(op or "", op),
+                    span_native, _text(row.get("caller_id")),
+                    _text(row.get("status_code")), row.get("latency_ms"),
+                    row.get("prompt_tokens"), row.get("completion_tokens"),
+                    row.get("total_tokens") or row.get("token_count"),
+                    None, None, tier,
+                ))
+            for measure in source["measures"]:
+                value = row.get(measure)
+                if value is None:
                     continue
-                span_native = next(
-                    (_text(row.get(f)) for f in id_fields if _text(row.get(f))), None
+                self._stage(
+                    agent_key, cloud, measure, "gen_ai",
+                    model_native, ts, value,
+                    attributed=1 if tier != "unattributed" else 0,
+                    resolution_tier=tier,
                 )
-                tid = _text(row.get("trace_id"))
-                trace_native = trace_agent.get(tid) if tid else None
-                agent_key, tier = self._resolve_agent(
-                    cloud, namespace, span_native, trace_native
+                facts += 1
+        return facts
+
+    def _load_bedrock_spans(self, source: dict, rows: list[dict]) -> int:
+        """AWS AgentCore OTel spans (aws/spans via ext-bedrock-traces).
+
+        AWS no tiene registro de agentes: la identidad vive SOLO en la traza,
+        asi que este loader DA DE ALTA dim_agent (cloud aws) desde el span --
+        resource.service.name como native_agent_id (estable por runtime; se
+        prefiere a gen_ai.agent.name, que a veces trae el framework generico),
+        y el ARN del runtime como descripcion. Es lo contrario de M365/audit,
+        donde el catalogo es la SSoT. name/kind/parent y los tokens in/out salen
+        del _drift; total_tokens y latency_ms son columnas declaradas; el modelo
+        sale de gen_ai.request.model cuando el span lo lleva."""
+        cloud = source["cloud"]
+        facts = 0
+        for row in rows:
+            ts = _text(row.get("timestamp"))
+            if ts is None:
+                continue
+            drift = _drift_dict(row.get("_drift"))
+            attrs = drift.get("span_attributes") or {}
+            native = (
+                _text(drift.get("service_name"))
+                or _text(row.get("gen_ai_agent_id"))
+                or _text(row.get("agent_endpoint_id"))
+            )
+            if native:
+                agent_key = self.agent_key(
+                    cloud, native,
+                    agent_name=_text(drift.get("service_name")) or native,
+                    agent_type=_text(drift.get("aws_service_type")),
+                    description=_text(row.get("agent_endpoint_id")),
+                    status="active", enabled=1,
                 )
-                model_native = (
-                    _text(row.get(source["model"])) if source["model"] else None
-                ) or UNKNOWN_MODEL
-                sid = _text(row.get("span_id"))
-                if tid and sid:
-                    op = _text(row.get("span_kind"))
-                    self._traces.append((
-                        tid, sid, _text(row.get("parent_span_id")),
-                        agent_key, self.model_key(cloud, model_native),
-                        self.date_key(ts), ts, op,
-                        self._SPAN_KIND.get(op or "", op),
-                        span_native, _text(row.get("caller_id")),
-                        _text(row.get("status_code")), row.get("latency_ms"),
-                        row.get("prompt_tokens"), row.get("completion_tokens"),
-                        row.get("total_tokens") or row.get("token_count"),
-                        None, None, tier,
-                    ))
-                for measure in source["measures"]:
-                    value = row.get(measure)
-                    if value is None:
-                        continue
-                    self._stage(
-                        agent_key, cloud, measure, "gen_ai",
-                        model_native, ts, value,
-                        attributed=1 if tier != "unattributed" else 0,
-                        resolution_tier=tier,
-                    )
-                    facts += 1
+                tier = "native"
+            else:
+                agent_key = self.agent_key(cloud, UNATTRIBUTED, agent_name=None)
+                tier = "unattributed"
+            model_native = _text(drift.get("gen_ai_request_model")) or UNKNOWN_MODEL
+            tid = _text(row.get("trace_id"))
+            sid = _text(row.get("span_id"))
+            if tid and sid:
+                self._traces.append((
+                    tid, sid, _text(drift.get("parent_span_id")),
+                    agent_key, self.model_key(cloud, model_native),
+                    self.date_key(ts), ts,
+                    _text(drift.get("span_name")),
+                    _text(drift.get("span_kind")),
+                    native,
+                    _text(row.get("session_id")),
+                    _text(row.get("error_type")),
+                    row.get("latency_ms"),
+                    _int(attrs.get("gen_ai.usage.input_tokens")
+                         or attrs.get("gen_ai.usage.prompt_tokens")),
+                    _int(attrs.get("gen_ai.usage.output_tokens")
+                         or attrs.get("gen_ai.usage.completion_tokens")),
+                    _int(row.get("token_count")),
+                    _first_tool(row.get("tool_invocations")),
+                    None,
+                    tier,
+                ))
+            for measure in source["measures"]:
+                value = row.get(measure)
+                if value is None:
+                    continue
+                self._stage(
+                    agent_key, cloud, measure, "gen_ai",
+                    model_native, ts, value,
+                    attributed=1 if tier != "unattributed" else 0,
+                    resolution_tier=tier,
+                )
+                facts += 1
         return facts
 
     def load_metrics(self, raw_root: str) -> int:

@@ -1,16 +1,60 @@
 """Backfill historico de Purview audit via Graph auditLogQuery (asincrono).
 
-Throttling y resiliencia (observado 2026-07-10/11):
-  * El tenant admite 1 sola query de backfill activa simultaneamente.
-  * Poll y descarga tolerantes a 5xx: no abortan el run.
-  * Descarga reanudable: si se interrumpe persiste nextLink + eventos
-    parciales en el state y los une en el siguiente barrido.
+Por que un script aparte del extractor ``ext-purview-audit``:
+  * La O365 Management Activity API (el feed del extractor) solo retiene
+    blobs 7 dias y en ventanas <=24h. El historico (180 dias en Audit
+    Standard) se recupera con la Purview Audit Search API de Graph:
+    ``POST /security/auditLog/queries`` (job asincrono en el servicio) +
+    ``GET .../queries/{id}/records`` (paginado @odata.nextLink).
+  * El enum ``recordTypeFilters`` de Graph v1.0 va por detras de los record
+    types Copilot/Agent365 (261/334/363/407). El filtro servidor robusto es
+    ``serviceFilter`` (= propiedad Workload del registro): 'Copilot' y
+    'Agent365'. El filtro de alcance cliente (``_to_record``) se aplica
+    igualmente, identico al extractor.
+  * Permiso requerido en la app (application): **AuditLogsQuery.Read.All**
+    con admin consent (Graph). Un 401/403 al crear la query = falta esto.
+
+Salida: los MISMOS parquets que el extractor (schema RawAuditEvent, via
+``_to_record`` + ``_to_table`` de ext-purview-audit), pero particionados por
+FECHA DE EVENTO (no de run):
+    m365/purview/audit_log/dt=<event-date>/part-backfill-<service>-<chunk>.parquet
+El solape con lo ya cargado es inocuo: ``fact_agent_audit`` dedupe por
+``record_id`` (PK) en el upsert del loader.
+
+Estado resumible en ``raw/_watermarks/ext-purview-audit-backfill.json``
+(query ids por chunk). Re-ejecutar retoma el polling y la descarga sin
+recrcar queries; borrar una entrada del JSON fuerza su re-creacion.
+Al arrancar se reconcilia con el servidor (adopta queries
+agentlens-backfill-* existentes por displayName). El polling/descarga
+cubre TODO el estado, no solo la rejilla del run actual: cambiar de
+--chunk-days/--from entre runs es seguro (las entradas de rejillas
+anteriores se drenan igualmente). No toca el watermark del extractor
+incremental.
+
+Descargas pausadas (5xx a mitad de paginado): los eventos ya bajados NO se
+embeben en el JSON de estado. Cada pausa vuelca SOLO lo nuevo a un fichero
+lateral ``_watermarks/backfill-partials/<svc>-<chunk>.part-NNNN.ndjson`` y
+el estado guarda contadores (``partial_parts``, ``partial_count``) mas la
+``resume_url``. Al completar el chunk se leen todos los parts, se escribe
+el parquet y los .ndjson quedan inertes (borrables a mano). Los estados
+antiguos con ``partial_records`` embebidos (formato previo, que inflaba el
+JSON a cientos de MB) se migran automaticamente al arrancar: se vuelcan a
+parts y el JSON adelgaza. Detener el proceso viejo ANTES de relanzar con
+esta version, para que no reescriba el estado con el formato antiguo.
+
+Throttling de creacion (observado 2026-07-10/11): el tenant admite UNA
+sola query de backfill activa al mismo tiempo. El 429 (TooManyRequests
+generico, sin Retry-After) persiste mientras ese job siga running.
+Estrategia: esperar a que el job activo termine, descargarlo, y solo
+entonces crear el siguiente. El poll es tolerante a 5xx transitorios
+(devuelve None y reintenta en el proximo barrido sin abortar el run).
 
 Uso (desde agentlens/):
+    uv run python .\\star\\backfill_audit_graph.py                     # 180 dias
     uv run python .\\star\\backfill_audit_graph.py --from 2026-01-26 --chunk-days 45
-    uv run python .\\star\\backfill_audit_graph.py --poll-interval 180  # red inestable
+    uv run python .\\star\\backfill_audit_graph.py --chunk-days 10 --poll-interval 30
 Despues de terminar:
-    uv run python .\\star\\build_star_pg.py
+    uv run python .\\star\\build_star_pg.py       # carga los parquets nuevos
 """
 
 from __future__ import annotations
@@ -29,6 +73,11 @@ sys.path.insert(0, _ROOT)
 
 
 def _load_env(root: str) -> None:
+    """Carga agentlens/.env en os.environ (sin pisar lo ya definido).
+
+    config.py delega la carga del .env en "el runner"; este script es su
+    propio runner. Sin dependencia de python-dotenv a proposito.
+    """
     path = os.path.join(root, ".env")
     if not os.path.exists(path):
         return
@@ -53,7 +102,9 @@ GRAPH_BASES = (
     "https://graph.microsoft.com/beta/security/auditLog/queries",
 )
 STATE_PATH = "_watermarks/ext-purview-audit-backfill.json"
+PARTIALS_DIR = "_watermarks/backfill-partials"
 TERMINAL = frozenset({"succeeded", "failed", "cancelled"})
+MAX_ACTIVE_QUERIES = 8  # el servicio limita las busquedas concurrentes
 
 
 def _chunks(d_from: date, d_to: date, days: int) -> list[tuple[date, date]]:
@@ -67,6 +118,8 @@ def _chunks(d_from: date, d_to: date, days: int) -> list[tuple[date, date]]:
 
 
 class _State:
+    """Estado resumible del backfill, persistido via el StorageBackend."""
+
     def __init__(self, backend) -> None:
         self._backend = backend
         raw = backend.read_text(STATE_PATH)
@@ -77,12 +130,75 @@ class _State:
 
     def put(self, key: str, value: dict) -> None:
         self.data["queries"][key] = value
+        self.save()
+
+    def save(self) -> None:
         self._backend.write_text_atomic(
             STATE_PATH, json.dumps(self.data, indent=1, sort_keys=True)
         )
 
 
+def _partial_part_rel(key: str, part: int) -> str:
+    """Ruta relativa del part ndjson de una descarga pausada."""
+    svc, _, day = key.partition("|")
+    return f"{PARTIALS_DIR}/{svc.lower()}-{day}.part-{part:04d}.ndjson"
+
+
+def _write_partial_part(backend, key: str, part: int, records: list) -> None:
+    """Vuelca un lote de records (JSON-nativos) a un part ndjson lateral."""
+    text = "\n".join(
+        json.dumps(r, ensure_ascii=False, separators=(",", ":")) for r in records
+    )
+    backend.write_text_atomic(_partial_part_rel(key, part), text)
+
+
+def _read_partial_parts(backend, key: str, parts: int) -> list:
+    """Lee y concatena los parts ndjson acumulados de un chunk."""
+    out: list = []
+    for i in range(parts):
+        rel = _partial_part_rel(key, i)
+        raw = backend.read_text(rel)
+        if not raw:
+            print(f"[backfill-audit] WARN part parcial ausente: {rel}; "
+                  "sus eventos se recuperaran del solape del proximo run",
+                  file=sys.stderr)
+            continue
+        out.extend(json.loads(line) for line in raw.splitlines() if line.strip())
+    return out
+
+
+def _migrate_inline_partials(backend, state: _State) -> None:
+    """Migracion unica del formato antiguo: ``partial_records`` embebidos.
+
+    El formato previo persistia los eventos de descargas pausadas DENTRO del
+    JSON de estado, que llegaba a cientos de MB y se reescribia entero en
+    cada pausa. Aqui se vuelcan a parts ndjson y el JSON adelgaza. Idempotente:
+    tras la primera ejecucion no queda ningun ``partial_records`` en el estado.
+    """
+    moved = 0
+    changed = False
+    for key, entry in state.data["queries"].items():
+        recs = entry.pop("partial_records", None)
+        if recs is None:
+            continue
+        changed = True
+        if not recs:
+            continue
+        parts = int(entry.get("partial_parts") or 0)
+        _write_partial_part(backend, key, parts, recs)
+        entry["partial_parts"] = parts + 1
+        entry["partial_count"] = int(entry.get("partial_count") or 0) + len(recs)
+        moved += len(recs)
+    if changed:
+        state.save()
+    if moved:
+        print(f"[backfill-audit] migrados {moved} eventos parciales embebidos "
+              f"en el estado -> {PARTIALS_DIR}/ (el JSON de estado queda ligero)",
+              file=sys.stderr)
+
+
 def _graph(call, *args, attempts: int = 5):
+    """Ejecuta una llamada Graph con backoff en 429/5xx."""
     for attempt in range(1, attempts + 1):
         status, body, retry_after = call(*args)
         if status == 429 or status >= 500:
@@ -92,10 +208,19 @@ def _graph(call, *args, attempts: int = 5):
             time.sleep(wait)
             continue
         return status, body
-    return status, body
+    return status, body  # ultimo intento, que decida el llamador
 
 
 def _resolve_base(ext, token: str) -> str:
+    """Elige v1.0 o beta sondeando el listado de queries (GET) antes de crear.
+
+    Observado 2026-07-10: POST /v1.0/security/auditLog/queries devuelve 404
+    UnknownError en tenants donde beta funciona -- Learn aun referencia la
+    Audit Search Graph API en beta y el rollout de v1.0 va por detras.
+    Ademas, tras conceder AuditLogsQuery.Read.All el backend de audit puede
+    tardar ~15-30 min en reconocer al service principal (403/404
+    transitorios con el mismo aspecto).
+    """
     last: tuple | None = None
     for base in GRAPH_BASES:
         status, body = _graph(ext._get_json, f"{base}?$top=1", token)
@@ -106,12 +231,22 @@ def _resolve_base(ext, token: str) -> str:
         print(f"[backfill-audit] sonda {base} -> HTTP {status}", file=sys.stderr)
     raise SystemExit(
         "[backfill-audit] ningun endpoint de auditLog/queries responde "
-        f"(ultimo: {last}). Reintentar tras 15-30 min si el consent es reciente."
+        f"(ultimo: {last}). Si el permiso AuditLogsQuery.Read.All se acaba "
+        "de conceder, el backend de audit puede tardar 15-30 min en "
+        "propagarlo: reintentar mas tarde sin tocar nada."
     )
 
 
 def _adopt_existing(ext, token: str, base: str, state: _State,
                     services: list[str]) -> None:
+    """Reconcilia con el servidor antes de crear nada.
+
+    Adopta al estado las queries ``agentlens-backfill-*`` que ya existan
+    (runs anteriores o cancelados) para no recrearlas -- los jobs siguen
+    corriendo en el servidor aunque el cliente muera -- e imprime el
+    inventario de jobs: con creacion serializada (1 job activo maximo en
+    este tenant), el inventario muestra cuantos hay aun running/queued.
+    """
     canonical = {s.lower(): s for s in services}
     url: str | None = f"{base}?$top=100"
     adopted = total = non_terminal = 0
@@ -139,11 +274,11 @@ def _adopt_existing(ext, token: str, base: str, state: _State,
                                 "status": str(q.get("status")),
                                 "done": False, "adopted": True})
                 adopted += 1
-                print(f"[backfill-audit] adoptada {key} "
-                      f"(status={q.get('status')})", file=sys.stderr)
+                print(f"[backfill-audit] adoptada {key} (ya existia en el "
+                      f"servidor, status={q.get('status')})", file=sys.stderr)
         url = body.get("@odata.nextLink")
-    print(f"[backfill-audit] inventario servidor: {total} queries "
-          f"({non_terminal} no terminales); {adopted} adoptadas",
+    print(f"[backfill-audit] inventario servidor: {total} queries de audit "
+          f"({non_terminal} no terminales); {adopted} adoptadas al estado",
           file=sys.stderr)
 
 
@@ -153,9 +288,13 @@ def _create_query(ext, token: str, base: str, service: str,
         "@odata.type": "#microsoft.graph.security.auditLogQuery",
         "displayName": f"agentlens-backfill-{service.lower()}-{start.isoformat()}",
         "filterStartDateTime": f"{start.isoformat()}T00:00:00Z",
+        # fin exclusivo: medianoche del dia siguiente al ultimo dia del chunk
         "filterEndDateTime": f"{(end + timedelta(days=1)).isoformat()}T00:00:00Z",
         "serviceFilter": service,
     }
+    # Un solo POST por intento: este 429 llega sin Retry-After y reintentar
+    # en caliente renueva la penalizacion; el ritmo lo pone el cooldown
+    # adaptativo del bucle principal.
     status, body, _retry = ext._post_json(base, token, payload)
     if status in (200, 201):
         return str(body["id"])
@@ -166,15 +305,19 @@ def _create_query(ext, token: str, base: str, service: str,
         return None
     if status in (401, 403):
         raise SystemExit(
-            f"[backfill-audit] HTTP {status}: app sin permiso "
-            "AuditLogsQuery.Read.All (Graph, application, admin consent). "
-            f"Detalle: {detail}"
+            f"[backfill-audit] HTTP {status} creando la query: la app necesita "
+            "el permiso APPLICATION 'AuditLogsQuery.Read.All' (Microsoft Graph) "
+            f"con admin consent. Detalle: {detail}"
         )
     raise RuntimeError(f"crear query fallo: HTTP {status}: {detail}")
 
 
 def _poll_status(ext, token: str, base: str, query_id: str) -> str | None:
-    """Sondea el estado. Devuelve None en 5xx (reintentable)."""
+    """Sondea el estado. Devuelve None en 5xx (reintentable sin abortar el run).
+
+    Solo 2 reintentos: el estado de un job de audit cambia en minutos, no
+    segundos; acumular 5 reintentos de 75s bloquea el barrido innecesariamente.
+    """
     status, body = _graph(ext._get_json, f"{base}/{query_id}", token, attempts=2)
     if status == 200:
         return str(body.get("status") or "unknown")
@@ -185,10 +328,11 @@ def _poll_status(ext, token: str, base: str, query_id: str) -> str | None:
 
 def _download(ext, token: str, base: str, query_id: str,
               resume_url: str | None = None) -> tuple[list[dict], str | None]:
-    """Pagina los records. Reanudable: devuelve (eventos, next_url).
+    """Pagina los records del job. Reanudable: devuelve (mapped, next_url).
 
-    next_url=None => descarga completa.
-    next_url=str  => 5xx a mitad; persistir y reanudar en el siguiente barrido.
+    Si next_url es None al retornar, la descarga esta completa.
+    Si es un string, hubo un 5xx en esa pagina; el llamador debe persistir
+    next_url en el state y reanudar en el siguiente barrido.
     """
     mapped: list[dict] = []
     url: str | None = resume_url or f"{base}/{query_id}/records?$top=999"
@@ -199,7 +343,7 @@ def _download(ext, token: str, base: str, query_id: str,
             print(f"[backfill-audit] WARN descarga de {query_id} -> HTTP {status} "
                   f"en pagina {page}; se reanuda en el proximo barrido",
                   file=sys.stderr)
-            return mapped, url
+            return mapped, url  # next_url != None => descarga incompleta
         page += 1
         for rec in body.get("value") or []:
             data = rec.get("auditData")
@@ -218,11 +362,14 @@ def _download(ext, token: str, base: str, query_id: str,
             print(f"[backfill-audit]   ... {page} paginas, "
                   f"{len(mapped)} eventos relevantes", file=sys.stderr)
         url = body.get("@odata.nextLink")
-    return mapped, None
+    return mapped, None  # descarga completa
 
 
 def _write_chunk(ext, raw_records: list[dict], service: str,
                  chunk_start: str) -> tuple[int, list[str]]:
+    """Valida/dedup con la maquinaria del extractor y escribe parquet por
+    FECHA DE EVENTO. Nombre de fichero estable por (dia, servicio, chunk):
+    re-ejecutar un chunk sobreescribe sus propios ficheros (idempotente)."""
     valid, invalid = ext.validate(raw_records)
     if invalid:
         ext.quarantine.write(invalid, datetime.now(timezone.utc).date())
@@ -244,13 +391,19 @@ def _write_chunk(ext, raw_records: list[dict], service: str,
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Backfill Purview audit via Graph auditLogQuery")
-    parser.add_argument("--from", dest="date_from")
-    parser.add_argument("--to", dest="date_to")
-    parser.add_argument("--chunk-days", type=int, default=15)
-    parser.add_argument("--services", default="Copilot,Agent365")
-    parser.add_argument("--poll-interval", type=float, default=60.0)
-    parser.add_argument("--max-wait-minutes", type=float, default=240.0)
+        description="Backfill de Purview audit (Graph auditLogQuery) al raw zone")
+    parser.add_argument("--from", dest="date_from",
+                        help="inicio YYYY-MM-DD (default: hoy-180d)")
+    parser.add_argument("--to", dest="date_to",
+                        help="fin YYYY-MM-DD inclusive (default: hoy)")
+    parser.add_argument("--chunk-days", type=int, default=15,
+                        help="dias por query asincrona (default 15)")
+    parser.add_argument("--services", default="Copilot,Agent365",
+                        help="serviceFilter por workload (default Copilot,Agent365)")
+    parser.add_argument("--poll-interval", type=float, default=60.0,
+                        help="segundos entre barridos de polling (default 60)")
+    parser.add_argument("--max-wait-minutes", type=float, default=240.0,
+                        help="corta el run (resumible) tras N minutos (default 240)")
     args = parser.parse_args()
 
     today = datetime.now(timezone.utc).date()
@@ -262,6 +415,7 @@ def main() -> int:
 
     ext = PurviewAuditExtractor()
     state = _State(ext.backend)
+    _migrate_inline_partials(ext.backend, state)
     keys = [(svc, cs, ce) for svc in services for cs, ce in chunks]
     print(f"[backfill-audit] rango {d_from}..{d_to} | {len(chunks)} chunks x "
           f"{len(services)} servicios = {len(keys)} queries", file=sys.stderr)
@@ -273,7 +427,7 @@ def main() -> int:
     deadline = time.monotonic() + args.max_wait_minutes * 60.0
     total_events = 0
     failed: list[str] = []
-    create_backoff = 120.0
+    create_backoff = 120.0   # cooldown adaptativo de creacion (429 sin Retry-After)
     next_create_at = 0.0
     while True:
         token = ext._aad_token(GRAPH_SCOPE)
@@ -282,7 +436,8 @@ def main() -> int:
             if (entry := state.get(f"{_svc}|{cs.isoformat()}")) is not None
             and entry.get("id") and entry.get("status") not in TERMINAL
         )
-        # serializado: solo crear cuando no hay jobs activos
+        # crear como mucho UNA query por barrido, solo si no estamos en
+        # cooldown y no hay ninguna activa (serializado en este tenant).
         if time.monotonic() >= next_create_at and active == 0:
             for svc, cs, ce in keys:
                 key = f"{svc}|{cs.isoformat()}"
@@ -290,8 +445,8 @@ def main() -> int:
                     continue
                 qid = _create_query(ext, token, base, svc, cs, ce)
                 if qid is None:
-                    print(f"[backfill-audit] cooldown {create_backoff/60:.1f} min",
-                          file=sys.stderr)
+                    print(f"[backfill-audit] cooldown de creacion "
+                          f"{create_backoff / 60:.1f} min", file=sys.stderr)
                     next_create_at = time.monotonic() + create_backoff
                     create_backoff = min(create_backoff * 2.0, 1800.0)
                 else:
@@ -303,10 +458,12 @@ def main() -> int:
                           file=sys.stderr)
                     create_backoff = 120.0
                     next_create_at = time.monotonic() + 60.0
-                break
+                break  # un intento de creacion por barrido
 
         missing = [1 for svc, cs, _ce in keys
                    if state.get(f"{svc}|{cs.isoformat()}") is None]
+        # el polling/descarga cubre TODO el estado (incluidas entradas de
+        # rejillas anteriores o adoptadas): las rejillas son componibles
         pending = [k for k, e in state.data["queries"].items()
                    if not e.get("done")]
         if not missing and not pending:
@@ -317,34 +474,46 @@ def main() -> int:
             entry = state.get(key)
             status = _poll_status(ext, token, base, entry["id"])
             if status is None:
-                continue
+                continue  # 5xx transitorio; reintentar en el proximo barrido
             if status != entry.get("status"):
                 entry = {**entry, "status": status}
                 state.put(key, entry)
                 print(f"[backfill-audit] {key}: {status}", file=sys.stderr)
             if status == "succeeded":
                 resume_url = entry.get("resume_url") or None
-                prev_records = entry.get("partial_records") or []
                 records, next_url = _download(ext, token, base, entry["id"],
                                               resume_url=resume_url)
-                all_records = prev_records + records
+                parts = int(entry.get("partial_parts") or 0)
                 if next_url is not None:
+                    # descarga incompleta: volcar SOLO lo nuevo a un part
+                    # ndjson lateral; el estado guarda contadores + URL
+                    if records:
+                        _write_partial_part(ext.backend, key, parts, records)
+                        parts += 1
+                    partial_count = (int(entry.get("partial_count") or 0)
+                                     + len(records))
                     state.put(key, {**entry, "resume_url": next_url,
-                                    "partial_records": all_records})
+                                    "partial_parts": parts,
+                                    "partial_count": partial_count})
                     print(f"[backfill-audit] {key}: descarga pausada "
-                          f"({len(all_records)} eventos)", file=sys.stderr)
+                          f"({partial_count} eventos hasta ahora)",
+                          file=sys.stderr)
                 else:
+                    all_records = (_read_partial_parts(ext.backend, key, parts)
+                                   + records)
                     count, files = _write_chunk(ext, all_records, svc, day)
                     total_events += count
                     state.put(key, {**entry, "done": True, "records": count,
                                     "files": files, "resume_url": None,
-                                    "partial_records": None})
-                    print(f"[backfill-audit] {key}: {count} eventos -> "
+                                    "partial_parts": parts,
+                                    "partial_count": None})
+                    print(f"[backfill-audit] {key}: {count} eventos relevantes -> "
                           f"{len(files)} parquets", file=sys.stderr)
             elif status in ("failed", "cancelled"):
                 state.put(key, {**entry, "done": True, "error": True})
                 failed.append(key)
-                print(f"[backfill-audit] WARN {key}: {status}", file=sys.stderr)
+                print(f"[backfill-audit] WARN {key}: {status} (borrar su "
+                      "entrada del state JSON para recrearla)", file=sys.stderr)
 
         missing = [1 for svc, cs, _ce in keys
                    if state.get(f"{svc}|{cs.isoformat()}") is None]
@@ -353,16 +522,16 @@ def main() -> int:
         if not missing and not pending:
             break
         if time.monotonic() > deadline:
-            print("[backfill-audit] max-wait alcanzado; relanzar para retomar",
-                  file=sys.stderr)
+            print("[backfill-audit] max-wait alcanzado; estado persistido -- "
+                  "re-ejecutar el script para retomar", file=sys.stderr)
             return 2
         time.sleep(args.poll_interval)
 
-    print(f"[backfill-audit] COMPLETADO: {total_events} eventos escritos" +
-          (f"; {len(failed)} chunks fallidos: {failed}" if failed else ""),
-          file=sys.stderr)
-    print("[backfill-audit] siguiente: uv run python .\\star\\build_star_pg.py",
-          file=sys.stderr)
+    print(f"[backfill-audit] COMPLETADO: {total_events} eventos relevantes "
+          f"escritos al raw zone" + (f"; {len(failed)} chunks fallidos: "
+          f"{failed}" if failed else ""), file=sys.stderr)
+    print("[backfill-audit] siguiente paso: "
+          "uv run python .\\star\\build_star_pg.py", file=sys.stderr)
     return 1 if failed else 0
 
 
